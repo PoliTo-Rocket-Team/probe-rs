@@ -4,7 +4,7 @@ pub(crate) mod common;
 pub mod usb_util;
 
 pub mod blackmagic;
-pub mod ch347usbjtag;
+pub mod ch347;
 pub mod cmsisdap;
 pub mod fake_probe;
 pub mod ftdi;
@@ -72,7 +72,7 @@ static DRIVERS: LazyLock<RwLock<Vec<&'static dyn ProbeFactory>>> = LazyLock::new
         &wlink::WchLinkFactory,
         &sifliuart::SifliUartFactory,
         &glasgow::GlasgowFactory,
-        &ch347usbjtag::Ch347UsbJtagFactory,
+        &ch347::Ch347Factory,
         &xvc::XvcFactory,
     ];
 
@@ -580,8 +580,14 @@ impl Probe {
             Err((probe, err)) => match probe.try_as_swd_probe() {
                 Ok(swd_probe) => {
                     let settings = swd_probe.swd_settings();
+                    // A probe that answers WAIT itself paces the transfers, the
+                    // others need overrun detection for stable communication.
+                    let use_overrun_detect = !swd_probe.handles_wait();
                     Ok(ArmCommunicationInterface::create_swd(
-                        swd_probe, settings, sequence, false,
+                        swd_probe,
+                        settings,
+                        sequence,
+                        use_overrun_detect,
                     ))
                 }
                 Err(probe) => Err((Probe::from_attached_probe(probe), err)),
@@ -827,11 +833,16 @@ pub trait DebugProbe: Any + Send + fmt::Debug {
     }
 
     /// Convert this probe into a layer-0 SWD probe, if it implements [`SwdProbe`].
+    ///
+    /// A probe in JTAG mode refuses, so that the caller uses the JTAG transport.
     fn try_as_swd_probe(self: Box<Self>) -> Result<Box<dyn SwdProbe>, Box<dyn DebugProbe>> {
         Err(self.into_probe())
     }
 
     /// Borrow this probe as a layer-0 SWD probe, if it implements [`SwdProbe`].
+    ///
+    /// A probe in JTAG mode may return itself, to run SWJ sequences and pin operations on the
+    /// JTAG pins.
     fn try_as_swd_probe_mut(&mut self) -> Option<&mut dyn SwdProbe> {
         None
     }
@@ -878,6 +889,12 @@ pub struct DebugProbeInfo {
     /// This is a composite HID device.
     pub is_hid_interface: bool,
 
+    /// USB bus ID and device address, if known.
+    ///
+    /// Tells identical probes (same VID/PID, no serial number) apart while they stay plugged
+    /// in. It is not part of the string form of a [`DebugProbeSelector`].
+    pub usb_location: Option<(String, u8)>,
+
     /// A reference to the [`ProbeFactory`] that created this info object.
     probe_factory: &'static dyn ProbeFactory,
 }
@@ -922,6 +939,7 @@ impl DebugProbeInfo {
             probe_factory,
             interface,
             is_hid_interface,
+            usb_location: None,
         }
     }
 

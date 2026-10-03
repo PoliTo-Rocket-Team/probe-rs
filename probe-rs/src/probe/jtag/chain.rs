@@ -50,7 +50,7 @@ impl ChainParams {
         (1 << self.irlen) - 1
     }
 
-    fn from_jtag_chain(chain: &[ScanChainElement], selected: usize) -> Option<Self> {
+    pub(crate) fn from_jtag_chain(chain: &[ScanChainElement], selected: usize) -> Option<Self> {
         let mut params = Self {
             index: selected,
             ..Default::default()
@@ -261,8 +261,8 @@ impl<'p> JtagChain<'p> {
     /// Schedule a move to Run-Test/Idle and optional idle clocks.
     ///
     /// An exchange holds the TAP in `Shift-*`, so the register does not latch
-    /// until the TAP passes through `Update-*`. Every batch that exchanges
-    /// must end with this call.
+    /// until the TAP passes through `Update-*`. End a batch that exchanges with
+    /// this call, unless the next batch continues the same shift.
     pub fn run_test_idle(&mut self, batch: &mut JtagBatch, cycles: u32) {
         batch.enter(TapState::RunTestIdle);
         if cycles > 0 {

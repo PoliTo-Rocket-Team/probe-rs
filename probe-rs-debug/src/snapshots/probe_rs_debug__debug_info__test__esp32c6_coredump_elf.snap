@@ -342,6 +342,30 @@ expression: stack_frames
       dwarf_id: ~
       value:
         U32: 1107300942
+    - core_register:
+        id: 833
+        roles:
+          - Core: mepc
+        data_type:
+          UnsignedInteger: 32
+      dwarf_id: 4929
+      value: ~
+    - core_register:
+        id: 834
+        roles:
+          - Core: mcause
+        data_type:
+          UnsignedInteger: 32
+      dwarf_id: 4930
+      value: ~
+    - core_register:
+        id: 768
+        roles:
+          - Core: mstatus
+        data_type:
+          UnsignedInteger: 32
+      dwarf_id: 4864
+      value: ~
   pc:
     U32: 1107300942
   frame_base: 1082582272
@@ -920,6 +944,30 @@ expression: stack_frames
       dwarf_id: ~
       value:
         U32: 1107318002
+    - core_register:
+        id: 833
+        roles:
+          - Core: mepc
+        data_type:
+          UnsignedInteger: 32
+      dwarf_id: 4929
+      value: ~
+    - core_register:
+        id: 834
+        roles:
+          - Core: mcause
+        data_type:
+          UnsignedInteger: 32
+      dwarf_id: 4930
+      value: ~
+    - core_register:
+        id: 768
+        roles:
+          - Core: mstatus
+        data_type:
+          UnsignedInteger: 32
+      dwarf_id: 4864
+      value: ~
   pc:
     U32: 1107318002
   frame_base: 1082582304
@@ -1244,6 +1292,30 @@ expression: stack_frames
       dwarf_id: ~
       value:
         U32: 1107296770
+    - core_register:
+        id: 833
+        roles:
+          - Core: mepc
+        data_type:
+          UnsignedInteger: 32
+      dwarf_id: 4929
+      value: ~
+    - core_register:
+        id: 834
+        roles:
+          - Core: mcause
+        data_type:
+          UnsignedInteger: 32
+      dwarf_id: 4930
+      value: ~
+    - core_register:
+        id: 768
+        roles:
+          - Core: mstatus
+        data_type:
+          UnsignedInteger: 32
+      dwarf_id: 4864
+      value: ~
   pc:
     U32: 1107296770
   frame_base: 1082582432
@@ -1774,6 +1846,30 @@ expression: stack_frames
       dwarf_id: ~
       value:
         U32: 1107296770
+    - core_register:
+        id: 833
+        roles:
+          - Core: mepc
+        data_type:
+          UnsignedInteger: 32
+      dwarf_id: 4929
+      value: ~
+    - core_register:
+        id: 834
+        roles:
+          - Core: mcause
+        data_type:
+          UnsignedInteger: 32
+      dwarf_id: 4930
+      value: ~
+    - core_register:
+        id: 768
+        roles:
+          - Core: mstatus
+        data_type:
+          UnsignedInteger: 32
+      dwarf_id: 4864
+      value: ~
   pc:
     U32: 1107296602
   frame_base: 1082582432
@@ -2288,6 +2384,30 @@ expression: stack_frames
       dwarf_id: ~
       value:
         U32: 1107317484
+    - core_register:
+        id: 833
+        roles:
+          - Core: mepc
+        data_type:
+          UnsignedInteger: 32
+      dwarf_id: 4929
+      value: ~
+    - core_register:
+        id: 834
+        roles:
+          - Core: mcause
+        data_type:
+          UnsignedInteger: 32
+      dwarf_id: 4930
+      value: ~
+    - core_register:
+        id: 768
+        roles:
+          - Core: mstatus
+        data_type:
+          UnsignedInteger: 32
+      dwarf_id: 4864
+      value: ~
   pc:
     U32: 1107317484
   frame_base: 1082582448
@@ -2622,6 +2742,30 @@ expression: stack_frames
       dwarf_id: ~
       value:
         U32: 1107317484
+    - core_register:
+        id: 833
+        roles:
+          - Core: mepc
+        data_type:
+          UnsignedInteger: 32
+      dwarf_id: 4929
+      value: ~
+    - core_register:
+        id: 834
+        roles:
+          - Core: mcause
+        data_type:
+          UnsignedInteger: 32
+      dwarf_id: 4930
+      value: ~
+    - core_register:
+        id: 768
+        roles:
+          - Core: mstatus
+        data_type:
+          UnsignedInteger: 32
+      dwarf_id: 4864
+      value: ~
   pc:
     U32: 1107317484
   frame_base: 1082582448
@@ -2965,6 +3109,30 @@ expression: stack_frames
       dwarf_id: ~
       value:
         U32: 1107317484
+    - core_register:
+        id: 833
+        roles:
+          - Core: mepc
+        data_type:
+          UnsignedInteger: 32
+      dwarf_id: 4929
+      value: ~
+    - core_register:
+        id: 834
+        roles:
+          - Core: mcause
+        data_type:
+          UnsignedInteger: 32
+      dwarf_id: 4930
+      value: ~
+    - core_register:
+        id: 768
+        roles:
+          - Core: mstatus
+        data_type:
+          UnsignedInteger: 32
+      dwarf_id: 4864
+      value: ~
   pc:
     U32: 1107317482
   frame_base: 1082582448
@@ -3357,6 +3525,30 @@ expression: stack_frames
       dwarf_id: ~
       value:
         U32: 1107317484
+    - core_register:
+        id: 833
+        roles:
+          - Core: mepc
+        data_type:
+          UnsignedInteger: 32
+      dwarf_id: 4929
+      value: ~
+    - core_register:
+        id: 834
+        roles:
+          - Core: mcause
+        data_type:
+          UnsignedInteger: 32
+      dwarf_id: 4930
+      value: ~
+    - core_register:
+        id: 768
+        roles:
+          - Core: mstatus
+        data_type:
+          UnsignedInteger: 32
+      dwarf_id: 4864
+      value: ~
   pc:
     U32: 1107317464
   frame_base: 1082582448
@@ -3691,6 +3883,30 @@ expression: stack_frames
       dwarf_id: ~
       value:
         U32: 1107317484
+    - core_register:
+        id: 833
+        roles:
+          - Core: mepc
+        data_type:
+          UnsignedInteger: 32
+      dwarf_id: 4929
+      value: ~
+    - core_register:
+        id: 834
+        roles:
+          - Core: mcause
+        data_type:
+          UnsignedInteger: 32
+      dwarf_id: 4930
+      value: ~
+    - core_register:
+        id: 768
+        roles:
+          - Core: mstatus
+        data_type:
+          UnsignedInteger: 32
+      dwarf_id: 4864
+      value: ~
   pc:
     U32: 1107317464
   frame_base: 1082582448
@@ -4025,6 +4241,30 @@ expression: stack_frames
       dwarf_id: ~
       value:
         U32: 1107296836
+    - core_register:
+        id: 833
+        roles:
+          - Core: mepc
+        data_type:
+          UnsignedInteger: 32
+      dwarf_id: 4929
+      value: ~
+    - core_register:
+        id: 834
+        roles:
+          - Core: mcause
+        data_type:
+          UnsignedInteger: 32
+      dwarf_id: 4930
+      value: ~
+    - core_register:
+        id: 768
+        roles:
+          - Core: mstatus
+        data_type:
+          UnsignedInteger: 32
+      dwarf_id: 4864
+      value: ~
   pc:
     U32: 1107296836
   frame_base: 1082582464
@@ -4499,6 +4739,30 @@ expression: stack_frames
       dwarf_id: ~
       value:
         U32: 1107297552
+    - core_register:
+        id: 833
+        roles:
+          - Core: mepc
+        data_type:
+          UnsignedInteger: 32
+      dwarf_id: 4929
+      value: ~
+    - core_register:
+        id: 834
+        roles:
+          - Core: mcause
+        data_type:
+          UnsignedInteger: 32
+      dwarf_id: 4930
+      value: ~
+    - core_register:
+        id: 768
+        roles:
+          - Core: mstatus
+        data_type:
+          UnsignedInteger: 32
+      dwarf_id: 4864
+      value: ~
   pc:
     U32: 1107297552
   frame_base: 1082582480
@@ -5066,6 +5330,30 @@ expression: stack_frames
       dwarf_id: ~
       value:
         U32: 1107313548
+    - core_register:
+        id: 833
+        roles:
+          - Core: mepc
+        data_type:
+          UnsignedInteger: 32
+      dwarf_id: 4929
+      value: ~
+    - core_register:
+        id: 834
+        roles:
+          - Core: mcause
+        data_type:
+          UnsignedInteger: 32
+      dwarf_id: 4930
+      value: ~
+    - core_register:
+        id: 768
+        roles:
+          - Core: mstatus
+        data_type:
+          UnsignedInteger: 32
+      dwarf_id: 4864
+      value: ~
   pc:
     U32: 1107313548
   frame_base: 1082582496
@@ -5432,6 +5720,30 @@ expression: stack_frames
       dwarf_id: ~
       value:
         U32: 1107296562
+    - core_register:
+        id: 833
+        roles:
+          - Core: mepc
+        data_type:
+          UnsignedInteger: 32
+      dwarf_id: 4929
+      value: ~
+    - core_register:
+        id: 834
+        roles:
+          - Core: mcause
+        data_type:
+          UnsignedInteger: 32
+      dwarf_id: 4930
+      value: ~
+    - core_register:
+        id: 768
+        roles:
+          - Core: mstatus
+        data_type:
+          UnsignedInteger: 32
+      dwarf_id: 4864
+      value: ~
   pc:
     U32: 1107296562
   frame_base: 1082582528

@@ -1,7 +1,8 @@
 //! CLI-specific building blocks.
 
 use std::future::pending;
-use std::io::Write;
+use std::io::{IsTerminal, Write};
+use std::sync::Arc;
 use std::time::Duration;
 use std::{future::Future, ops::DerefMut, path::Path, time::Instant};
 
@@ -52,6 +53,7 @@ use probe_rs_rpc::stack_trace::StackTrace;
 use probe_rs_rpc::stack_trace::StackTraceFrame;
 use probe_rs_rpc::test::{Test, TestResult};
 use probe_rs_rpc_client::{MonitorEvent, RpcClient, SessionInterface};
+use probe_rs_zephyr::log::{Database as ZephyrLogDatabase, Decoder as ZephyrLogDecoder};
 
 type TargetOutputFiles = std::collections::HashMap<ChannelIdentifier, tokio::fs::File>;
 
@@ -84,7 +86,7 @@ pub async fn attach_probe(
         client.load_chip_family(file).await?;
     }
 
-    let probe = match select_probe(
+    let mut probe = match select_probe(
         client,
         probe_options.probe.map(to_wire_debug_probe_selector),
         probe_options.non_interactive,
@@ -104,6 +106,8 @@ pub async fn attach_probe(
             Duration::from_secs(1),
         )
         .await?;
+        // The probe gets a new USB device address when it enumerates again.
+        probe.usb_location = None;
     }
 
     let result = with_slow_attach_feedback(client.attach_probe(AttachRequest {
@@ -423,6 +427,7 @@ pub(crate) fn parse_semihosting_options(arg: &[String]) -> anyhow::Result<Semiho
 #[derive(Default)]
 pub struct FileMetadata {
     pub defmt_data: Option<DefmtState>,
+    pub zephyr_log_dictionary: Option<Arc<ZephyrLogDatabase>>,
     pub scan_regions: Option<ScanRegion>,
 }
 
@@ -452,9 +457,18 @@ pub async fn parse_metadata(path: &Path) -> anyhow::Result<(FileMetadata, Option
         None
     };
 
+    let zephyr_log_dictionary = match ZephyrLogDatabase::from_elf(&elf) {
+        Ok(db) => db.map(Arc::new),
+        Err(error) => {
+            tracing::warn!("Failed to load the embedded Zephyr log dictionary: {error:#}");
+            None
+        }
+    };
+
     Ok((
         FileMetadata {
             defmt_data,
+            zephyr_log_dictionary,
             scan_regions,
         },
         elf_meta,
@@ -470,6 +484,19 @@ pub async fn rtt_client(
     let scan_regions = match &meta.scan_regions {
         Some(scan_regions) => scan_regions.clone(),
         None => monitor_options.scan_region.clone(),
+    };
+
+    let zephyr_log_dictionary = match &monitor_options.zephyr_log_dictionary {
+        Some(path) => {
+            let data = tokio::fs::read(path).await.with_context(|| {
+                format!(
+                    "Failed to read Zephyr log dictionary from {}",
+                    path.display()
+                )
+            })?;
+            Some(Arc::new(ZephyrLogDatabase::from_bytes(&data)?))
+        }
+        None => meta.zephyr_log_dictionary.clone(),
     };
 
     // We don't really know what to configure here, so we set a default configuration if we can, but that's it.
@@ -492,6 +519,7 @@ pub async fn rtt_client(
         show_location: !monitor_options.no_location,
         channel_processors: vec![],
         defmt_data: meta.defmt_data.clone(),
+        zephyr_log_dictionary,
         log_format: monitor_options.log_format.clone(),
     })
 }
@@ -734,6 +762,10 @@ pub async fn monitor(
         pending().await
     };
 
+    fn prompt_possible() -> bool {
+        std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
+    }
+
     // Gets activated when the RTT client discovers down channels.
     // Displays a prompt and waits for user input.
     async fn cli_with_prompt(session: &SessionInterface, context: &MonitorUiContext) {
@@ -826,7 +858,7 @@ pub async fn monitor(
                     DisplayMode::Exited
                 } else if monitor_options.list_rtt {
                     DisplayMode::ListChannelsAndQuit
-                } else if locked.down_channels.is_empty() {
+                } else if locked.down_channels.is_empty() || !prompt_possible() {
                     DisplayMode::OutputOnly
                 } else {
                     DisplayMode::CliWithPrompt
@@ -948,7 +980,15 @@ pub async fn monitor(
 
             println!("Firmware exited with: {reason}{subcode}");
 
-            (true, Err(anyhow::anyhow!(reason)))
+            let (error, print_stack_trace) = match (details.reason, details.subcode) {
+                // A deliberate exit, so like a successful one, only print a stack trace on request.
+                (0x20026, Some(status)) => (
+                    FirmwareExitStatus(status).into(),
+                    monitor_options.always_print_stacktrace,
+                ),
+                _ => (anyhow::anyhow!(reason), true),
+            };
+            (print_stack_trace, Err(error))
         }
         Err(e) => {
             // Some irrecoverable error happened, probably can't print the stack trace.
@@ -965,6 +1005,21 @@ pub async fn monitor(
     }
 
     result
+}
+
+/// The firmware exited with a non-zero status through semihosting.
+#[derive(Debug, thiserror::Error)]
+#[error("Firmware exited with status {0}")]
+pub struct FirmwareExitStatus(pub u32);
+
+impl FirmwareExitStatus {
+    /// Statuses that don't fit in an exit code map to 1, so a failure never reads as success.
+    pub fn exit_code(&self) -> u8 {
+        match u8::try_from(self.0) {
+            Ok(0) | Err(_) => 1,
+            Ok(code) => code,
+        }
+    }
 }
 
 /// Describes why the core halted, for a user who runs firmware and does not
@@ -1247,6 +1302,7 @@ pub struct CliRttClient {
     show_location: bool,
     timestamp_offset: Option<UtcOffset>,
     defmt_data: Option<DefmtState>,
+    zephyr_log_dictionary: Option<Arc<ZephyrLogDatabase>>,
 }
 
 impl CliRttClient {
@@ -1260,9 +1316,23 @@ impl CliRttClient {
             return;
         }
 
+        // Zephyr outputs dictionary-based logs on a single channel, which the database records.
+        let zephyr_dict_channel = self
+            .zephyr_log_dictionary
+            .as_ref()
+            .map(|db| db.rtt_channel().unwrap_or(0) as usize);
+
         // Apply our heuristics based on channel names.
-        for channel in up_channels.iter() {
-            let decoder = if channel.name == "defmt" {
+        for (number, channel) in up_channels.iter().enumerate() {
+            let decoder = if let Some(db) = self
+                .zephyr_log_dictionary
+                .as_ref()
+                .filter(|_| zephyr_dict_channel == Some(number))
+            {
+                RttDecoder::ZephyrDict {
+                    processor: ZephyrLogDecoder::new(db.clone()),
+                }
+            } else if channel.name == "defmt" {
                 if let Some(defmt_data) = self.defmt_data.clone() {
                     RttDecoder::Defmt {
                         processor: DefmtProcessor::new(
@@ -1398,5 +1468,27 @@ impl Channel {
                 _ = copy_to.write_all(data.as_bytes()).await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FirmwareExitStatus;
+
+    #[test]
+    fn firmware_exit_code() {
+        assert_eq!(FirmwareExitStatus(1).exit_code(), 1);
+        assert_eq!(FirmwareExitStatus(42).exit_code(), 42);
+        assert_eq!(FirmwareExitStatus(255).exit_code(), 255);
+        // Must not be reported as success
+        assert_eq!(FirmwareExitStatus(256).exit_code(), 1);
+        assert_eq!(FirmwareExitStatus(0).exit_code(), 1);
+    }
+
+    #[test]
+    fn firmware_exit_status_through_anyhow() {
+        let error = anyhow::Error::from(FirmwareExitStatus(3)).context("while running");
+        let status = error.downcast_ref::<FirmwareExitStatus>().unwrap();
+        assert_eq!(status.exit_code(), 3);
     }
 }

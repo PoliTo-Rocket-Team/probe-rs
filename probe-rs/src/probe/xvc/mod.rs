@@ -35,7 +35,7 @@ use crate::{
     probe::{
         BitbangJtag, BitbangSwd, DebugProbe, DebugProbeError, DebugProbeInfo, DebugProbeSelector,
         IoSequenceItem, JtagChain, JtagChainAccess, JtagChainState, ProbeFactory, SwdProbe,
-        SwdSettings, TapState, WireProtocol, list::ProbeListItem,
+        SwdSettings, TapState, WireProtocol, list::ProbeListItem, swd::output_levels,
     },
 };
 
@@ -91,6 +91,7 @@ impl ProbeFactory for XvcFactory {
                 probe_factory: &Self,
                 is_hid_interface: false,
                 interface: None,
+                usb_location: None,
             })];
         }
 
@@ -231,13 +232,16 @@ impl DebugProbe for XvcProbe {
 }
 
 impl BitbangSwd for XvcProbe {
-    fn swd_io<S>(&mut self, _swdio: S) -> Result<Vec<bool>, DebugProbeError>
+    fn swd_io<S>(&mut self, swdio: S) -> Result<Vec<bool>, DebugProbeError>
     where
         S: IntoIterator<Item = IoSequenceItem>,
     {
-        Err(DebugProbeError::NotImplemented {
-            function_name: "swd_io",
-        })
+        let levels = output_levels(swdio)?;
+        for &tms in &levels {
+            self.device.shift_bit(tms, false, false)?;
+        }
+        self.device.read_captured_bits()?;
+        Ok(vec![false; levels.len()])
     }
 
     fn swd_settings(&self) -> &SwdSettings {

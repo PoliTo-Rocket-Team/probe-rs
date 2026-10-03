@@ -7,6 +7,7 @@ use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
+use std::process::ExitCode;
 use std::sync::Arc;
 use std::{ffi::OsString, path::PathBuf};
 
@@ -24,23 +25,30 @@ use serde::{Deserialize, Serialize};
 use time::{OffsetDateTime, UtcOffset};
 
 use crate::rpc::functions::RpcApp;
+use crate::util::cli::FirmwareExitStatus;
 use crate::util::logging::setup_logging;
 use probe_rs_rpc_client::{RemoteParams, RpcClient};
 
 const MAX_LOG_FILES: usize = 20;
 
 #[cfg(feature = "remote")]
-pub(crate) const HOST_LONG_HELP: &str = "Remote host to connect to.\n\n\
-    Accepted URL prefixes:\n  \
-    ws://, wss://   a probe-rs serve websocket\n  \
-    ssh://          a probe-rs serve websocket, tunnelled through ssh\n  \
-    socket://       a probe-rs serve unix socket (Unix only)\n\n\
-    The ssh:// form takes [user@]destination[:port] and runs \
-    `ssh <destination> -W 127.0.0.1:<port>`, so the server must listen on the \
-    loopback interface of the remote host. The port defaults to 3000.\n\n\
-    probe-rs gives ssh no other options. Name the destination in your ssh \
-    configuration file to select an identity file, a jump host, or an ssh \
-    port other than 22.";
+pub(crate) const HOST_LONG_HELP: &str = r"Remote host to connect to.
+
+Accepted URL prefixes:
+  ws://, wss://   a probe-rs serve websocket
+  ssh://          a probe-rs serve websocket, tunnelled through ssh
+  socket://       a probe-rs serve unix socket (Unix only)
+
+A ws:// or wss:// URL can have a path, for example the prefix of a reverse
+proxy.
+
+The ssh:// form takes [user@]destination[:port] and runs
+`ssh <destination> -W 127.0.0.1:<port>`, so the server must listen on the
+loopback interface of the remote host. The port defaults to 3000.
+
+probe-rs gives ssh no other options. Name the destination in your ssh
+configuration file to select an identity file, a jump host, or an ssh port
+other than 22.";
 
 type ConfigPreset = HashMap<String, Value>;
 
@@ -312,7 +320,20 @@ fn multicall_check(args: &[OsString], want: &str) -> Option<Vec<OsString>> {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> ExitCode {
+    match run().await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("Error: {error:?}");
+            let code = error
+                .downcast_ref::<FirmwareExitStatus>()
+                .map_or(1, FirmwareExitStatus::exit_code);
+            ExitCode::from(code)
+        }
+    }
+}
+
+async fn run() -> Result<()> {
     probe_rs_espressif::register_plugin();
     #[cfg(target_os = "linux")]
     probe_rs_linux::register_plugin();

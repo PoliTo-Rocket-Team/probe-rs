@@ -67,6 +67,8 @@ pub(crate) struct MockSwdProbe {
     capture_flags: Arc<Mutex<Vec<bool>>>,
     idles: Arc<Mutex<Vec<u32>>>,
     pins: Arc<Mutex<Vec<RecordedPins>>>,
+    pin_levels: Option<u8>,
+    swd_settings: SwdSettings,
 }
 
 impl MockSwdProbe {
@@ -84,7 +86,15 @@ impl MockSwdProbe {
             capture_flags: Arc::new(Mutex::new(Vec::new())),
             idles: Arc::new(Mutex::new(Vec::new())),
             pins: Arc::new(Mutex::new(Vec::new())),
+            pin_levels: None,
+            swd_settings: SwdSettings::default(),
         }
+    }
+
+    /// Read `levels` back for every pins operation, as a CMSIS-DAP probe does.
+    pub(crate) fn reads_pins(mut self, levels: u8) -> Self {
+        self.pin_levels = Some(levels);
+        self
     }
 
     /// Return a handle to the recorded operations.
@@ -114,9 +124,12 @@ impl MockSwdProbe {
         self
     }
 
-    /// Create a mock probe. `settings` is unused.
-    pub(crate) fn with_settings(_settings: SwdSettings) -> Self {
-        Self::new()
+    /// Create a mock probe that reports `settings`.
+    pub(crate) fn with_settings(settings: SwdSettings) -> Self {
+        Self {
+            swd_settings: settings,
+            ..Self::new()
+        }
     }
 
     /// Queue the next transfer response.
@@ -299,6 +312,11 @@ impl SwdProbe for MockSwdProbe {
                         select: select.0,
                         wait: *wait,
                     });
+                    if let Some(levels) = self.pin_levels
+                        && id.should_capture()
+                    {
+                        results.push(id, CommandResult::U8(levels));
+                    }
                 }
             }
         }
@@ -312,5 +330,9 @@ impl SwdProbe for MockSwdProbe {
 
     fn handles_ap_pipeline(&self) -> bool {
         self.handles_ap_pipeline
+    }
+
+    fn swd_settings(&self) -> SwdSettings {
+        self.swd_settings.clone()
     }
 }

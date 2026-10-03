@@ -701,19 +701,18 @@ static FTDI_COMPAT_DEVICES: &[FtdiDevice] = &[
         id: (0x15ba, 0x002b),
         fallback_chip_type: ChipType::FT2232H,
     },
-
-	// PoliTo Rocket Team: DaVinci
-	FtdiDevice {
+    // PoliTo Rocket Team: DaVinci
+    FtdiDevice {
         id: (0xf024, 0x0001),
         fallback_chip_type: ChipType::FT2232H,
     },
-	// PoliTo Rocket Team: Marconi
-	FtdiDevice {
+    // PoliTo Rocket Team: Marconi
+    FtdiDevice {
         id: (0xf024, 0x0002),
         fallback_chip_type: ChipType::FT2232H,
     },
-	// PoliTo Rocket Team: Actuator
-	FtdiDevice {
+    // PoliTo Rocket Team: Actuator
+    FtdiDevice {
         id: (0xf024, 0x0003),
         fallback_chip_type: ChipType::FT2232H,
     },

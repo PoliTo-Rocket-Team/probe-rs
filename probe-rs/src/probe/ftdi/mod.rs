@@ -611,12 +611,14 @@ impl TryFrom<(FtdiDevice, Option<ChipType>)> for FtdiProperties {
         };
 
         let properties = match chip_type {
-            ChipType::FT2232H | ChipType::FT4232H => Self {
-                buffer_size: 4096,
-                max_clock: 30_000,
-                has_divide_by_5: true,
-            },
-            ChipType::FT232H => Self {
+            ChipType::FT2232H | ChipType::FT4232H | ChipType::FT2232HP | ChipType::FT4232HP => {
+                Self {
+                    buffer_size: 4096,
+                    max_clock: 30_000,
+                    has_divide_by_5: true,
+                }
+            }
+            ChipType::FT232H | ChipType::FT232HP => Self {
                 buffer_size: 1024,
                 max_clock: 30_000,
                 has_divide_by_5: true,

@@ -23,8 +23,11 @@ pub enum ChipType {
     FT2232C,
     R,
     FT2232H,
+    FT2232HP,
     FT4232H,
+    FT4232HP,
     FT232H,
+    FT232HP,
     FT230X,
 }
 
@@ -413,6 +416,9 @@ impl Device {
             (0x800, _) => Some(ChipType::FT4232H),
             (0x900, _) => Some(ChipType::FT232H),
             (0x1000, _) => Some(ChipType::FT230X),
+            (0x3000, _) => Some(ChipType::FT2232HP),
+            (0x3100, _) => Some(ChipType::FT4232HP),
+            (0x3300, _) => Some(ChipType::FT232HP),
 
             (version, _) => {
                 tracing::warn!("Unknown FTDI device version: {:X?}", version);

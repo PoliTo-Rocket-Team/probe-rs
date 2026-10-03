@@ -5,7 +5,7 @@
 
 on:
   push:
-    branches: [master, staging, trying]
+    branches: [master, staging, trying, prt]
   pull_request:
   merge_group:
 

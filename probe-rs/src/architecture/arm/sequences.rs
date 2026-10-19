@@ -11,6 +11,7 @@ use std::{
 use probe_rs_target::CoreType;
 
 pub use crate::flashing::DebugFlashSequence;
+use crate::flashing::FlashVerify;
 
 use crate::{
     MemoryInterface, MemoryMappedRegister,
@@ -371,6 +372,16 @@ fn cortex_m_reset_catch_clear(core: &mut dyn ArmMemoryInterface) -> Result<(), A
 fn cortex_m_reset_catch_set(core: &mut dyn ArmMemoryInterface) -> Result<(), ArmError> {
     use crate::architecture::arm::core::armv7m::{Demcr, Dhcsr};
 
+    // The vector catch only halts with halting debug enabled. Under hardware reset this runs
+    // before DebugCoreStart, and a previous session's DebugCoreStop has cleared C_DEBUGEN.
+    // A core can only be halted with C_DEBUGEN set, so writing C_DEBUGEN alone resumes nothing.
+    if !Dhcsr(core.read_word_32(Dhcsr::get_mmio_address())?).c_debugen() {
+        let mut dhcsr = Dhcsr(0);
+        dhcsr.set_c_debugen(true);
+        dhcsr.enable_write();
+        core.write_word_32(Dhcsr::get_mmio_address(), dhcsr.into())?;
+    }
+
     // Request halt after reset
     let mut demcr = Demcr(core.read_word_32(Demcr::get_mmio_address())?);
     demcr.set_vc_corereset(true);
@@ -512,6 +523,19 @@ pub trait ArmDebugSequence: Send + Sync + Debug {
     ///     https://open-cmsis-pack.github.io/Open-CMSIS-Pack-Spec/main/html/debug_description.html#debugPortSetup
     #[doc(alias = "DebugPortSetup")]
     fn debug_port_setup(
+        &self,
+        interface: &mut dyn DebugPortWire,
+        dp: DpAddress,
+    ) -> Result<(), ArmError> {
+        self.debug_port_setup_default(interface, dp)
+    }
+
+    /// The stock `DebugPortSetup` implementation, split out from
+    /// [`debug_port_setup`](ArmDebugSequence::debug_port_setup) so that vendor sequences which
+    /// only need to add device-specific steps can run it without copying the body.
+    ///
+    /// There is no reason to override this; override `debug_port_setup` and call this from it.
+    fn debug_port_setup_default(
         &self,
         interface: &mut dyn DebugPortWire,
         dp: DpAddress,
@@ -1199,12 +1223,13 @@ pub trait ArmDebugSequence: Send + Sync + Debug {
         Ok(())
     }
 
-    /// Called before attaching to a core.
+    /// Called before attaching to a core. May update the session-local memory map.
     fn on_attach(
         &self,
         _interface: &mut dyn ArmDebugInterface,
         _ap: &FullyQualifiedApAddress,
         _core_type: CoreType,
+        _target: &mut crate::Target,
     ) -> Result<(), ArmError> {
         Ok(())
     }
@@ -1220,6 +1245,15 @@ pub trait ArmDebugSequence: Send + Sync + Debug {
     /// operations are performed from the host via debug interface commands
     /// rather than a RAM-based flash algorithm.
     fn debug_flash_sequence(&self) -> Option<Arc<dyn DebugFlashSequence>> {
+        None
+    }
+
+    /// Return the fast flash verification implementation if one exists.
+    ///
+    /// A target whose flash controller can compute a signature over a range of flash lets the
+    /// flash loader check an image without reading it back. The default is `None`, so
+    /// verification reads the contents back as before.
+    fn flash_verify_sequence(&self) -> Option<Arc<dyn FlashVerify>> {
         None
     }
 

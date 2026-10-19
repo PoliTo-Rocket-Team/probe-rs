@@ -186,18 +186,22 @@ impl FlasherOps for HostSideFlasher {
             verify,
         )
     }
-    fn compute_init_sizes(&mut self, _keep_unwritten_bytes: bool) -> (FlashLayout, u64, u64, u64) {
-        // Host-side always sends raw pages — no fill operations, no encoding.
+    fn compute_init_sizes(&mut self, keep_unwritten_bytes: bool) -> (FlashLayout, u64, u64, u64) {
+        // Host-side always sends raw pages and reads fill regions directly when requested.
         let mut phase_layout = FlashLayout::default();
+        let mut fill_size = 0;
         let mut erase_size = 0;
         let mut program_size = 0;
         for region in &self.regions {
             let layout = region.flash_layout();
             phase_layout.merge_from(layout.clone());
+            if keep_unwritten_bytes {
+                fill_size += layout.fills().iter().map(|fill| fill.size()).sum::<u64>();
+            }
             erase_size += layout.sectors().iter().map(|s| s.size()).sum::<u64>();
             program_size += layout.pages().iter().map(|p| p.size() as u64).sum::<u64>();
         }
-        (phase_layout, 0, erase_size, program_size)
+        (phase_layout, fill_size, erase_size, program_size)
     }
     fn compute_verify_size(&mut self) -> u64 {
         self.regions
@@ -410,7 +414,6 @@ mod builtin {
             _session: &mut Session,
             file: &mut dyn ImageReader,
         ) -> Result<(), FileDownloadError> {
-            const VECTOR_TABLE_SECTION_NAME: &str = ".vector_table";
             let mut elf_buffer = Vec::new();
             file.read_to_end(&mut elf_buffer)?;
 
@@ -424,16 +427,9 @@ mod builtin {
             tracing::info!("Found {} loadable sections:", extracted_data.len());
 
             for section in &extracted_data {
-                let sources = &section.section_names;
-                for name in &section.section_names {
-                    if name == VECTOR_TABLE_SECTION_NAME {
-                        flash_loader.set_vector_table_addr(section.address as _);
-                    }
-                }
-
                 tracing::info!(
                     "    {:?} at {:#010X} ({} byte{})",
-                    sources,
+                    &section.section_names,
                     section.address,
                     section.data.len(),
                     if section.data.len() == 1 { "" } else { "s" }
@@ -442,6 +438,14 @@ mod builtin {
 
             for data in extracted_data {
                 flash_loader.add_data(data.address.into(), data.data)?;
+            }
+
+            // get the vector_table_addr, it will be used to prepare boot
+            if let Some(address) = crate::flashing::vector_table::find_in_elf(
+                &elf_buffer,
+                flash_loader.flash_builder(),
+            ) {
+                flash_loader.set_vector_table_addr(address);
             }
 
             Ok(())

@@ -31,7 +31,7 @@ use crate::util::{
     common_options::{BinaryDownloadOptions, ProbeOptions},
     flash::CliProgressBars,
     logging,
-    rtt::{DefmtProcessor, DefmtState, RttDecoder},
+    stream_decoder::{AutoDecoder, DefmtProcessor, DefmtState, StreamDecoder, TextDecoder},
     style::{
         Prompt, StackTraceAddress, StackTraceFunction, StackTraceInlineMarker,
         StackTraceSourceLocation, probe_rs_color_enabled,
@@ -116,7 +116,6 @@ pub async fn attach_probe(
         probe,
         speed: probe_options.speed,
         connect_under_reset: probe_options.connect_under_reset,
-        dry_run: probe_options.dry_run,
         allow_erase_all: probe_options.allow_erase_all,
         resume_target,
         wait_for_probe: probe_options.attach_timeout,
@@ -748,17 +747,11 @@ pub async fn monitor(
         .await;
     });
 
-    // SIGTERM handler on *nix systems
+    // SIGTERM (Unix) / Ctrl+Break (Windows) handler
     let terminate = async {
-        #[cfg(unix)]
-        {
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .expect("failed to install signal handler")
-                .recv()
-                .await;
-            eprintln!("Received SIGTERM, exiting");
-            session.client().publish::<CancelTopic>(&()).await.unwrap();
-        }
+        let signal = terminate_signal().await;
+        eprintln!("Received {signal}, exiting");
+        session.client().publish::<CancelTopic>(&()).await.unwrap();
         pending().await
     };
 
@@ -930,19 +923,22 @@ pub async fn monitor(
 
     let (print_stack_trace, result) = match result {
         Ok(MonitorExitReason::SemihostingExit(Ok(_))) => {
-            println!("Firmware exited successfully");
             // On success, we only print if the user asked for it.
-            (monitor_options.always_print_stacktrace, Ok(()))
+            (
+                monitor_options.always_print_stacktrace,
+                Ok("Firmware exited successfully"),
+            )
         }
         Ok(MonitorExitReason::UserExit) => {
-            println!("Exited by user request");
             // On ctrl-c, we only print if the user asked for it.
-            (monitor_options.always_print_stacktrace, Ok(()))
+            (
+                monitor_options.always_print_stacktrace,
+                Ok("Exited by user request"),
+            )
         }
         Ok(MonitorExitReason::Halted(halt_reason)) => {
-            let reason = describe_halt_reason(halt_reason);
-            println!("Firmware exited unexpectedly: {reason}");
-            (true, Err(anyhow::anyhow!(reason)))
+            let reason = describe_halt_reason(halt_reason).to_string();
+            (true, Err(FirmwareExited::Unexpected(reason).into()))
         }
         Ok(MonitorExitReason::SemihostingExit(Err(details))) => {
             let reason = match details.reason {
@@ -978,17 +974,17 @@ pub async fn monitor(
                 _ => String::from(""),
             };
 
-            println!("Firmware exited with: {reason}{subcode}");
-
-            let (error, print_stack_trace) = match (details.reason, details.subcode) {
+            match (details.reason, details.subcode) {
                 // A deliberate exit, so like a successful one, only print a stack trace on request.
                 (0x20026, Some(status)) => (
-                    FirmwareExitStatus(status).into(),
                     monitor_options.always_print_stacktrace,
+                    Err(FirmwareExited::WithStatus(status).into()),
                 ),
-                _ => (anyhow::anyhow!(reason), true),
-            };
-            (print_stack_trace, Err(error))
+                _ => (
+                    true,
+                    Err(FirmwareExited::WithReason(format!("{reason}{subcode}")).into()),
+                ),
+            }
         }
         Err(e) => {
             // Some irrecoverable error happened, probably can't print the stack trace.
@@ -1004,20 +1000,37 @@ pub async fn monitor(
         }
     }
 
-    result
+    match result {
+        Ok(message) => {
+            println!("{message}");
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// The firmware exited with a non-zero status through semihosting.
-#[derive(Debug, thiserror::Error)]
-#[error("Firmware exited with status {0}")]
-pub struct FirmwareExitStatus(pub u32);
+#[derive(Debug, thiserror::Error, docsplay::Display)]
+pub enum FirmwareExited {
+    /// Firmware exited with status {0}
+    WithStatus(u32),
 
-impl FirmwareExitStatus {
+    /// Firmware exited: {0}
+    WithReason(String),
+
+    /// Firmware stopped unexpectedly: {0}
+    Unexpected(String),
+}
+
+impl FirmwareExited {
     /// Statuses that don't fit in an exit code map to 1, so a failure never reads as success.
     pub fn exit_code(&self) -> u8 {
-        match u8::try_from(self.0) {
-            Ok(0) | Err(_) => 1,
-            Ok(code) => code,
+        match self {
+            Self::WithStatus(status) => match u8::try_from(*status) {
+                Ok(0) | Err(_) => 1,
+                Ok(code) => code,
+            },
+            _ => 1,
         }
     }
 }
@@ -1259,7 +1272,30 @@ pub(crate) fn format_stack_frame(frame: &StackTraceFrame) -> String {
     s
 }
 
-/// Runs a future until completion, running another future when Ctrl+C is received.
+/// Waits for SIGTERM (Unix) or Ctrl+Break (Windows), as sent by process supervisors.
+async fn terminate_signal() -> &'static str {
+    cfg_select! {
+        unix => {
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("failed to install signal handler")
+                .recv()
+                .await;
+            "SIGTERM"
+        }
+        windows => {
+            tokio::signal::windows::ctrl_break()
+                .expect("failed to install signal handler")
+                .recv()
+                .await;
+            "Ctrl+Break"
+        }
+        _ => {
+            std::future::pending().await
+        }
+    }
+}
+
+/// Runs a future until completion, running another future when a shutdown signal is received.
 ///
 /// This function enables cooperative asynchronous cancellation without dropping the future.
 async fn with_ctrl_c<F, I>(f: F, on_ctrl_c: I) -> F::Output
@@ -1268,19 +1304,10 @@ where
     I: Future,
 {
     let mut run = std::pin::pin!(f);
-    #[cfg(unix)]
-    let terminate = async {
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("failed to install signal handler")
-            .recv()
-            .await;
-    };
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
 
     tokio::select! {
         _ = tokio::signal::ctrl_c() => eprintln!("Received Ctrl+C, exiting"),
-        _ = terminate => eprintln!("Received SIGTERM, exiting"),
+        signal = terminate_signal() => eprintln!("Received {signal}, exiting"),
         result = &mut run => return result,
     };
 
@@ -1329,12 +1356,12 @@ impl CliRttClient {
                 .as_ref()
                 .filter(|_| zephyr_dict_channel == Some(number))
             {
-                RttDecoder::ZephyrDict {
+                StreamDecoder::ZephyrDict {
                     processor: ZephyrLogDecoder::new(db.clone()),
                 }
             } else if channel.name == "defmt" {
                 if let Some(defmt_data) = self.defmt_data.clone() {
-                    RttDecoder::Defmt {
+                    StreamDecoder::Defmt {
                         processor: DefmtProcessor::new(
                             defmt_data,
                             self.show_timestamps,
@@ -1344,13 +1371,22 @@ impl CliRttClient {
                     }
                 } else {
                     // Not much we can do. Don't silently eat the data.
-                    RttDecoder::BinaryLE
+                    StreamDecoder::BinaryLE
                 }
             } else {
-                RttDecoder::String {
-                    timestamp_offset: self.timestamp_offset,
-                    last_line_done: false,
-                    show_timestamps: self.show_timestamps,
+                let defmt = self.defmt_data.clone().map(|defmt_data| {
+                    DefmtProcessor::new(
+                        defmt_data,
+                        self.show_timestamps,
+                        self.show_location,
+                        self.log_format.as_deref(),
+                    )
+                });
+                StreamDecoder::Auto {
+                    decoder: AutoDecoder::new(
+                        TextDecoder::new(self.timestamp_offset, self.show_timestamps),
+                        defmt,
+                    ),
                 }
             };
 
@@ -1436,12 +1472,12 @@ impl<'a> std::fmt::Display for ChannelInfoPrinter<'a> {
 
 struct Channel {
     channel: String,
-    decoder: RttDecoder,
+    decoder: StreamDecoder,
     printer_prefix: String,
 }
 
 impl Channel {
-    fn new(channel: String, decoder: RttDecoder) -> Self {
+    fn new(channel: String, decoder: StreamDecoder) -> Self {
         Self {
             channel,
             decoder,
@@ -1473,22 +1509,24 @@ impl Channel {
 
 #[cfg(test)]
 mod tests {
-    use super::FirmwareExitStatus;
+    use super::FirmwareExited;
 
     #[test]
     fn firmware_exit_code() {
-        assert_eq!(FirmwareExitStatus(1).exit_code(), 1);
-        assert_eq!(FirmwareExitStatus(42).exit_code(), 42);
-        assert_eq!(FirmwareExitStatus(255).exit_code(), 255);
+        assert_eq!(FirmwareExited::WithStatus(1).exit_code(), 1);
+        assert_eq!(FirmwareExited::WithStatus(42).exit_code(), 42);
+        assert_eq!(FirmwareExited::WithStatus(255).exit_code(), 255);
         // Must not be reported as success
-        assert_eq!(FirmwareExitStatus(256).exit_code(), 1);
-        assert_eq!(FirmwareExitStatus(0).exit_code(), 1);
+        assert_eq!(FirmwareExited::WithStatus(256).exit_code(), 1);
+        assert_eq!(FirmwareExited::WithStatus(0).exit_code(), 1);
+        assert_eq!(FirmwareExited::WithReason(String::from("")).exit_code(), 1);
+        assert_eq!(FirmwareExited::Unexpected(String::from("")).exit_code(), 1);
     }
 
     #[test]
     fn firmware_exit_status_through_anyhow() {
-        let error = anyhow::Error::from(FirmwareExitStatus(3)).context("while running");
-        let status = error.downcast_ref::<FirmwareExitStatus>().unwrap();
+        let error = anyhow::Error::from(FirmwareExited::WithStatus(3)).context("while running");
+        let status = error.downcast_ref::<FirmwareExited>().unwrap();
         assert_eq!(status.exit_code(), 3);
     }
 }

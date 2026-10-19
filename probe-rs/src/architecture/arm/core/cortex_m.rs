@@ -4,7 +4,7 @@ use crate::memory::{Operation, OperationKind};
 use crate::{
     CoreInterface, Error, MemoryMappedRegister,
     architecture::arm::{ArmError, memory::ArmMemoryInterface},
-    core::RegisterId,
+    core::{RegisterId, VectorCatchCondition},
     memory_mapped_bitfield_register,
     semihosting::SemihostingCommand,
     semihosting::decode_semihosting_syscall,
@@ -46,6 +46,17 @@ impl Dhcsr {
         self.0 &= !(0xffff << 16);
         self.0 |= 0xa05f << 16;
     }
+}
+
+memory_mapped_bitfield_register! {
+    /// Debug Exception and Monitor Control Register, DEMCR
+    ///
+    /// Only the vector catch bits common to ARMv6-M and ARMv7-M are modelled here.
+    pub struct Demcr(u32);
+    0xE000_EDFC, "DEMCR",
+    impl From;
+    pub vc_harderr, set_vc_harderr: 10;
+    pub vc_corereset, set_vc_corereset: 0;
 }
 
 memory_mapped_bitfield_register! {
@@ -200,6 +211,69 @@ pub(crate) fn write_core_reg(
     wait_for_core_register_transfer(memory, Duration::from_millis(100))
 }
 
+/// Leave Debug state, either running freely or stepping one instruction.
+///
+/// A single DHCSR write cannot clear C_HALT and change C_MASKINTS, so C_MASKINTS is settled in
+/// its own write first. See ARM DDI 0419E C1.6.3, DDI 0403E.e C1.6.3 and DDI 0553B.v D1.2.38.
+pub(crate) fn exit_halt(memory: &mut dyn ArmMemoryInterface, step: bool) -> Result<(), ArmError> {
+    let mut dhcsr = Dhcsr(memory.read_word_32(Dhcsr::get_mmio_address())?);
+
+    if !dhcsr.c_debugen() {
+        tracing::warn!("Leaving halt while DHCSR.C_DEBUGEN is false");
+    }
+
+    // C_HALT stays 1 in this write, which is what makes the C_MASKINTS change predictable.
+    if dhcsr.c_maskints() != step {
+        dhcsr.set_c_maskints(step);
+        dhcsr.enable_write();
+        memory.write_word_32(Dhcsr::get_mmio_address(), dhcsr.into())?;
+        memory.flush()?;
+    }
+
+    dhcsr.set_c_step(step);
+    dhcsr.set_c_halt(false);
+    dhcsr.set_c_debugen(true);
+    dhcsr.enable_write();
+    memory.write_word_32(Dhcsr::get_mmio_address(), dhcsr.into())?;
+    memory.flush()
+}
+
+/// Set DHCSR.C_DEBUGEN, keeping the debug key so the write is not ignored.
+pub(crate) fn enable_halting_debug(memory: &mut dyn ArmMemoryInterface) -> Result<(), ArmError> {
+    let mut dhcsr = Dhcsr(memory.read_word_32(Dhcsr::get_mmio_address())?);
+    dhcsr.set_c_debugen(true);
+    dhcsr.enable_write();
+    memory.write_word_32(Dhcsr::get_mmio_address(), dhcsr.into())
+}
+
+/// Enable or disable a vector catch condition.
+///
+/// ARMv6-M and ARMv7-M only. ARMv8-M also has VC_SFERR and keeps its own copy.
+pub(crate) fn set_vector_catch(
+    memory: &mut dyn ArmMemoryInterface,
+    condition: VectorCatchCondition,
+    enable: bool,
+) -> Result<(), Error> {
+    let mut demcr = Demcr(memory.read_word_32(Demcr::get_mmio_address())?);
+    match condition {
+        VectorCatchCondition::HardFault => demcr.set_vc_harderr(enable),
+        VectorCatchCondition::CoreReset => demcr.set_vc_corereset(enable),
+        VectorCatchCondition::All => {
+            demcr.set_vc_harderr(enable);
+            demcr.set_vc_corereset(enable);
+        }
+        VectorCatchCondition::SecureFault => {
+            return Err(Error::Arm(ArmError::ArchitectureRequired(&["ARMv8"])));
+        }
+        VectorCatchCondition::Svc | VectorCatchCondition::Hlt => {
+            return Err(Error::NotImplemented("vector catch condition Svc/Hlt"));
+        }
+    };
+
+    memory.write_word_32(Demcr::get_mmio_address(), demcr.into())?;
+    Ok(())
+}
+
 /// Check if the current breakpoint is a semihosting call.
 ///
 /// Call this if you get some kind of breakpoint. Works on ARMv6-M, ARMv7-M and ARMv8-M.
@@ -241,6 +315,30 @@ pub(crate) fn check_for_semihosting(
     Ok(command)
 }
 
+/// Returns true if `instruction` is a Thumb `BKPT` (`0xBExx`).
+pub(crate) fn is_bkpt_instruction(instruction: u16) -> bool {
+    const BKPT_MASK: u16 = 0xFF00;
+    const BKPT_ENCODING: u16 = 0xBE00;
+
+    instruction & BKPT_MASK == BKPT_ENCODING
+}
+
+/// Reads the halfword at `address` and checks if it is a `BKPT`.
+///
+/// If the read fails we treat it as not a `BKPT`, so we never skip an instruction we couldn't read.
+pub(crate) fn is_bkpt_at(core: &mut dyn CoreInterface, address: u64) -> bool {
+    let mut instruction = [0u8; 2];
+    match core.read_8(address, &mut instruction) {
+        Ok(()) => is_bkpt_instruction(u16::from_le_bytes(instruction)),
+        Err(error) => {
+            tracing::warn!(
+                "Could not read the instruction at {address:#010x}, not advancing the PC: {error}"
+            );
+            false
+        }
+    }
+}
+
 fn wait_for_core_register_transfer(
     memory: &mut dyn ArmMemoryInterface,
     timeout: Duration,
@@ -257,4 +355,25 @@ fn wait_for_core_register_transfer(
         }
     }
     Err(ArmError::Timeout)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_bkpt_instruction;
+
+    #[test]
+    fn is_bkpt_instruction_tells_bkpt_from_branch_to_self() {
+        for (instruction, expected) in [
+            (0xBE00, true),  // BKPT #0
+            (0xBEAB, true),  // BKPT #0xAB (semihosting)
+            (0xE7FE, false), // B . (branch to itself)
+            (0xBF00, false), // NOP
+        ] {
+            assert_eq!(
+                is_bkpt_instruction(instruction),
+                expected,
+                "{instruction:#06x}"
+            );
+        }
+    }
 }

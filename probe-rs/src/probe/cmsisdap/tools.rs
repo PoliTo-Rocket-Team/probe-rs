@@ -104,17 +104,26 @@ fn get_cmsisdap_info(device: &DeviceInfo, list_both_versions: bool) -> Vec<Debug
     // 2. Any that are HID, if the product string says CMSIS-DAP,
     //    to save for potential HID-only operation.
     for interface in device.interfaces() {
-        let interface_desc = interface.interface_string();
+        let interface_desc = interface.interface_string().map(str::to_owned).or_else(|| {
+            // Windows may omit interface strings for devices bound directly to
+            // WinUSB, in which case nusb can fetch it from the device.
+            if (interface.class(), interface.subclass())
+                == (USB_CMSIS_DAP_CLASS, USB_CMSIS_DAP_SUBCLASS)
+            {
+                interface.get_interface_string().wait().ok().flatten()
+            } else {
+                None
+            }
+        });
 
-        // An interface qualifies either by its own string, or - when it has none - by the
-        // device's product string. SEGGER's J-Link in CMSIS-DAP mode omits the interface
-        // string that the CMSIS-DAP v2 spec recommends, but still presents a vendor-specific
-        // bulk interface and names itself "J-Link CMSIS-DAP". Requiring the v2 class here
-        // keeps a stringless HID interface out; those are found by the HID scan instead.
-        let qualifies = match interface_desc {
+        // An interface qualifies by its own string. An interface with no string
+        // at all qualifies only for a device in the known list, because a
+        // stringless vendor-specific interface is not otherwise distinguishable
+        // from an unrelated one that happens to sit on the same device.
+        let qualifies = match interface_desc.as_deref() {
             Some(desc) => is_cmsis_dap(desc),
             None => {
-                cmsis_dap_product
+                is_known_cmsis_dap_dev(device)
                     && (interface.class(), interface.subclass())
                         == (USB_CMSIS_DAP_CLASS, USB_CMSIS_DAP_SUBCLASS)
             }
@@ -135,7 +144,7 @@ fn get_cmsisdap_info(device: &DeviceInfo, list_both_versions: bool) -> Vec<Debug
             tracing::trace!(
                 "  Interface {}: {}",
                 interface.interface_number(),
-                interface_desc.unwrap_or("<no interface string>"),
+                interface_desc.as_deref().unwrap_or("<no interface string>"),
             );
             let selected_interface = Some(interface.interface_number());
             let is_hid_interface = if interface.class() == USB_CLASS_HID {
@@ -230,8 +239,6 @@ pub fn open_v2_device(
     // Open device handle and read basic information
     let vid = device_info.vendor_id();
     let pid = device_info.product_id();
-    let cmsis_dap_product = is_cmsis_dap(device_info.product_string().unwrap_or(""))
-        || is_known_cmsis_dap_dev(device_info);
 
     tracing::trace!(
         "Trying to open {:04x}:{:04x} in cmsis-dap v2 mode",
@@ -276,24 +283,21 @@ pub fn open_v2_device(
         }
         for i_desc in interface.alt_settings() {
             // Skip interfaces without "CMSIS-DAP" like pattern in their string. An interface
-            // with no string at all is still accepted when the device's product string
-            // identifies it as CMSIS-DAP, which is how SEGGER's J-Link presents its
-            // CMSIS-DAP mode. The endpoint checks below remain the real gate.
+            // with no string at all is accepted only for a device in the known list; see
+            // `is_known_cmsis_dap_dev`. The endpoint checks below remain the real gate.
             let interface_str = device_info
                 .interfaces()
                 .find(|i| i.interface_number() == interface.interface_number())
-                .and_then(|i| i.interface_string());
+                .and_then(|i| i.get_interface_string().wait().ok().flatten());
 
-            match interface_str {
+            match interface_str.as_deref() {
                 Some(interface_str) if is_cmsis_dap(interface_str) => {}
                 Some(_) => {
                     tracing::trace!("Interface does not have 'CMSIS-DAP' in string");
                     continue;
                 }
-                None if cmsis_dap_product => {
-                    tracing::trace!(
-                        "Interface has no string; accepting it on the product string instead"
-                    );
+                None if is_known_cmsis_dap_dev(device_info) => {
+                    tracing::trace!("Interface has no string; accepting it as a known device");
                 }
                 None => {
                     tracing::trace!("Interface does not have interface string");
@@ -564,7 +568,9 @@ fn is_cmsis_dap(id: &str) -> bool {
 fn is_known_cmsis_dap_dev(device: &DeviceInfo) -> bool {
     // - 1a86:8012 WCH-Link in DAP mode, This shares the same description string as the
     //   WCH-Link in RV mode, so we have to check by vendor ID and product ID.
-    const KNOWN_DAPS: &[(u16, u16)] = &[(0x1a86, 0x8012)];
+    // - 1366:1080 SEGGER J-Link in CMSIS-DAP mode. It names itself "J-Link CMSIS-DAP"
+    //   but omits the interface string that the CMSIS-DAP v2 spec recommends.
+    const KNOWN_DAPS: &[(u16, u16)] = &[(0x1a86, 0x8012), (0x1366, 0x1080)];
 
     KNOWN_DAPS
         .iter()
@@ -585,9 +591,12 @@ fn is_known_cmsis_dap_dev(device: &DeviceInfo) -> bool {
 #[cfg(feature = "cmsisdap_v1")]
 fn hid_report_size(device: &hidapi::DeviceInfo) -> usize {
     // EDBG are 512-bytes and don't respond until you give them 512 bytes.
+    // The nEDBG on the Curiosity Nano boards also says "EDBG" in its
+    // product string ("nEDBG CMSIS-DAP"), but its reports are the usual
+    // 64 bytes.
     if device.vendor_id() == 0x03eb
         && let Some(s) = device.product_string()
-        && s.contains("EDBG")
+        && s.starts_with("EDBG")
     {
         tracing::debug!("Overriding packet size to 512 bytes for EDBG device");
         return 512;

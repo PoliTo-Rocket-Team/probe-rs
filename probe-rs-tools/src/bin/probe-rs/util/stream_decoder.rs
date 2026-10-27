@@ -87,6 +87,20 @@ impl StreamDecoder {
         }
         Ok(Some(DecodedData::String(string)))
     }
+
+    /// Returns the data that waits for more input, and ends the last line.
+    /// Use this when the stream starts again, for example after a reset.
+    pub fn flush(&mut self) -> String {
+        match self {
+            StreamDecoder::String(decoder) => decoder.flush(),
+            StreamDecoder::Defmt { processor } => {
+                processor.reset();
+                String::new()
+            }
+            StreamDecoder::Auto { decoder } => decoder.flush(),
+            StreamDecoder::BinaryLE | StreamDecoder::ZephyrDict { .. } => String::new(),
+        }
+    }
 }
 
 /// Decodes text. Adds a timestamp at the start of each line, if enabled.
@@ -146,6 +160,22 @@ impl TextDecoder {
         }
         output
     }
+
+    fn flush(&mut self) -> String {
+        let mut output = String::from_utf8_lossy(&std::mem::take(&mut self.partial)).into_owned();
+        output.push_str(self.end_line());
+        output
+    }
+
+    /// Returns a line end if the last line is not complete.
+    fn end_line(&mut self) -> &'static str {
+        if self.at_line_start {
+            ""
+        } else {
+            self.at_line_start = true;
+            "\n"
+        }
+    }
 }
 
 /// Returns the length of an incomplete UTF-8 character at the end of `data`.
@@ -174,11 +204,8 @@ impl Display for DecodedData<'_> {
         match self {
             DecodedData::String(s) => f.write_str(s),
             DecodedData::Binary(data) => {
-                for element in *data {
-                    // Width of 4 allows 0xFF to be printed.
-                    write!(f, "{element:#04x}").expect("Writing to String cannot fail");
-                }
-                Ok(())
+                // A space after each byte keeps the bytes apart across chunks.
+                data.iter().try_for_each(|byte| write!(f, "{byte:02x} "))
             }
         }
     }
@@ -285,16 +312,24 @@ impl DefmtProcessor {
                 format,
                 is_timestamp_available: has_timestamp && show_timestamps,
             }),
-            decoder: unsafe {
-                // Extend lifetime to 'static. We can do this because we hold a reference to the
-                // defmt_data's inner table for the lifetime of the processor.
-                std::mem::transmute::<
-                    Box<dyn DefmtStreamDecoder>,
-                    Box<dyn DefmtStreamDecoder + 'static>,
-                >(defmt_data.as_ref().table.new_stream_decoder())
-            },
+            decoder: Self::new_decoder(&defmt_data),
             defmt_data: defmt_data.clone(),
         }
+    }
+
+    fn new_decoder(defmt_data: &DefmtState) -> Box<dyn DefmtStreamDecoder + 'static> {
+        unsafe {
+            // Extend lifetime to 'static. We can do this because we hold a reference to the
+            // defmt_data's inner table for the lifetime of the processor.
+            std::mem::transmute::<Box<dyn DefmtStreamDecoder>, Box<dyn DefmtStreamDecoder + 'static>>(
+                defmt_data.as_ref().table.new_stream_decoder(),
+            )
+        }
+    }
+
+    /// Drops an incomplete frame.
+    fn reset(&mut self) {
+        self.decoder = Self::new_decoder(&self.defmt_data);
     }
 
     /// Returns `true` if `data` starts a valid defmt stream for this table.
@@ -363,11 +398,16 @@ impl DefmtProcessor {
     }
 }
 
+/// The frame start that esp-println puts before each defmt frame. A `00` byte ends the frame.
+const ESP_FRAME_START: &[u8] = &[0xFF, 0x00];
+const ESP_FRAME_END: &[u8] = &[0x00];
+
 /// The number of bytes to collect for a defmt check, if no frame ends earlier.
 const DETECT_LEN: usize = 32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DetectedFormat {
+    /// Text. esp-println defmt frames (`FF 00 <rzcobs> 00`) can be inside.
     Text,
     /// A plain rzcobs defmt stream, as defmt-rtt sends.
     Defmt,
@@ -381,11 +421,12 @@ pub struct AutoDecoder {
     defmt: Option<DefmtProcessor>,
     format: Option<DetectedFormat>,
     pending: Vec<u8>,
+    in_frame: bool,
 }
 
 impl AutoDecoder {
     pub fn new(text: TextDecoder, defmt: Option<DefmtProcessor>) -> Self {
-        // Only rzcobs frames can be found reliably.
+        // Only rzcobs frames can be found in a mixed stream.
         let defmt = defmt.filter(|processor| {
             processor.defmt_data.table().encoding() == defmt_decoder::Encoding::Rzcobs
         });
@@ -394,6 +435,7 @@ impl AutoDecoder {
             defmt,
             format: None,
             pending: Vec::new(),
+            in_frame: false,
         }
     }
 
@@ -414,17 +456,42 @@ impl AutoDecoder {
 
         let pending = std::mem::take(&mut self.pending);
         match (format, self.defmt.as_mut()) {
-            (DetectedFormat::Text, _) => Ok(self.text.process(&pending)),
+            (DetectedFormat::Text, _) => {
+                self.pending = pending;
+                Ok(self.process_text())
+            }
             (DetectedFormat::Defmt, Some(defmt)) => defmt.process(&pending),
             _ => Ok(hex(&pending)),
         }
+    }
+
+    fn flush(&mut self) -> String {
+        let pending = std::mem::take(&mut self.pending);
+        let mut output = if self.in_frame && !pending.is_empty() {
+            // An esp-println frame that did not end.
+            self.process_frame(&pending)
+        } else if self.format.is_none() && !looks_like_text(&pending) {
+            hex(&pending)
+        } else {
+            self.text.process(&pending)
+        };
+        self.in_frame = false;
+        if let Some(defmt) = &mut self.defmt {
+            defmt.reset();
+        }
+        output.push_str(&self.text.flush());
+        output
     }
 
     /// Returns `None` if more data is necessary.
     fn detect(&self) -> Option<DetectedFormat> {
         let data = self.pending.as_slice();
 
-        if looks_like_text(data) {
+        // A lone 0xFF can be the start of an esp-println frame.
+        if ESP_FRAME_START.starts_with(data) {
+            return None;
+        }
+        if data.starts_with(ESP_FRAME_START) || looks_like_text(data) {
             return Some(DetectedFormat::Text);
         }
         if let Some(defmt) = &self.defmt {
@@ -436,8 +503,74 @@ impl AutoDecoder {
                 return None;
             }
         }
+        if find(data, ESP_FRAME_START).is_some() {
+            return Some(DetectedFormat::Text);
+        }
         Some(DetectedFormat::Binary)
     }
+
+    /// Splits the pending data into text and esp-println defmt frames.
+    fn process_text(&mut self) -> String {
+        let mut output = String::new();
+
+        loop {
+            let (start, needle) = if self.in_frame {
+                // Skip the zeros before the frame.
+                let Some(start) = self.pending.iter().position(|&b| b != 0) else {
+                    break;
+                };
+                (start, ESP_FRAME_END)
+            } else {
+                (0, ESP_FRAME_START)
+            };
+            let Some(len) = find(&self.pending[start..], needle) else {
+                break;
+            };
+
+            let part = self.pending[start..][..len].to_vec();
+            self.pending.drain(..start + len + needle.len());
+
+            if self.in_frame {
+                output.push_str(&self.process_frame(&part));
+            } else {
+                output.push_str(&self.text.process(&part));
+            }
+            self.in_frame = !self.in_frame;
+        }
+
+        if !self.in_frame {
+            // A trailing 0xFF can be the start of a frame.
+            let len = self.pending.len() - usize::from(self.pending.ends_with(&[0xFF]));
+            let part = self.pending.drain(..len).collect::<Vec<_>>();
+            output.push_str(&self.text.process(&part));
+        }
+
+        output
+    }
+
+    fn process_frame(&mut self, frame: &[u8]) -> String {
+        // Start the frame on a new line.
+        let mut output = self.text.end_line().to_string();
+
+        let decoded = self
+            .defmt
+            .as_mut()
+            .and_then(|defmt| defmt.process(&[frame, ESP_FRAME_END].concat()).ok());
+        match decoded {
+            Some(decoded) => output.push_str(&decoded),
+            None => {
+                output.push_str(hex(frame).trim_end());
+                output.push('\n');
+            }
+        }
+        output
+    }
+}
+
+fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 fn hex(data: &[u8]) -> String {
@@ -508,6 +641,51 @@ mod tests {
     fn binary_is_shown_as_hex() {
         let mut decoder = auto();
         let data = [0x01u8, 0x02, 0x03, 0x80, 0x81, 0x00, 0x05, 0x06].repeat(4);
-        assert_eq!(decode(&mut decoder, &[&data]), hex(&data));
+        assert_eq!(
+            decode(&mut decoder, &[&data]),
+            "01 02 03 80 81 00 05 06 ".repeat(4)
+        );
+    }
+
+    #[test]
+    fn esp_frames_without_defmt_table_are_shown_as_hex() {
+        let mut decoder = auto();
+        assert_eq!(
+            decode(
+                &mut decoder,
+                &[b"ESP-ROM:esp32c3\n\xFF", b"\x00\x01\x02\x00", b"after\n"]
+            ),
+            "ESP-ROM:esp32c3\n01 02\nafter\n"
+        );
+    }
+
+    #[test]
+    fn esp_frame_starts_on_a_new_line() {
+        let mut decoder = auto();
+        assert_eq!(
+            decode(
+                &mut decoder,
+                &[b"partial line\n", b"no end", b"\xFF\x00\x07\x00"]
+            ),
+            "partial line\nno end\n07\n"
+        );
+    }
+
+    #[test]
+    fn esp_frame_can_end_in_the_next_chunk() {
+        let mut decoder = auto();
+        assert_eq!(
+            decode(&mut decoder, &[b"text\n\xFF\x00\x07", b"\x00more\n"]),
+            "text\n07\nmore\n"
+        );
+    }
+
+    #[test]
+    fn stream_can_start_with_an_esp_frame() {
+        let mut decoder = auto();
+        assert_eq!(
+            decode(&mut decoder, &[b"\xFF", b"\x00\x07\x00text\n"]),
+            "07\ntext\n"
+        );
     }
 }

@@ -33,11 +33,11 @@ pub struct SwdSettings {
     /// low.
     pub num_idle_cycles_between_writes: usize,
 
-    /// How often a SWD transfer is retried when a WAIT response
+    /// How often an SWD transfer is retried when a WAIT response
     /// is received.
     pub num_retries_after_wait: usize,
 
-    /// When a SWD transfer is retried due to a WAIT response, the idle
+    /// When an SWD transfer is retried due to a WAIT response, the idle
     /// cycle amount is doubled every time as a backoff. This sets a maximum
     /// cap to the cycle amount.
     pub max_retry_idle_cycles_after_wait: usize,
@@ -79,7 +79,7 @@ pub use port::{SwdPort, SwdPortError};
 bitfield::bitfield! {
     /// A struct to describe the default CMSIS-DAP pins that one can toggle from the host.
     #[derive(Copy, Clone)]
-    pub struct Pins(u8);
+    pub struct Pins(pub u8);
     impl Debug;
     /// The active low reset of the debug probe.
     pub nreset, set_nreset: 7;
@@ -660,6 +660,8 @@ mod tests {
                 command_name: "target_reset_assert",
             })
         }
+
+        fn set_reset_line_connected(&mut self, _connected: bool) {}
 
         fn target_reset_deassert(&mut self) -> Result<(), DebugProbeError> {
             Ok(())

@@ -1,8 +1,11 @@
 //! CMSIS-DAP probe implementation.
+mod arm;
 mod cmsis_swd;
 mod commands;
 mod tcp;
 mod tools;
+
+pub use commands::VendorCommandId;
 
 use crate::{
     CoreStatus,
@@ -10,7 +13,7 @@ use crate::{
         arm::{
             ArmCommunicationInterface, ArmDebugInterface, ArmError, DapError, SwoAccess, SwoConfig,
             SwoMode,
-            dp::{Abort, Ctrl, DpRegister},
+            dp::{Abort, Ctrl, DpRegister, DpRegisterAddress},
             sequences::ArmDebugSequence,
             swo::poll_interval_from_buf_size,
         },
@@ -24,10 +27,15 @@ use crate::{
     },
     probe::{
         DebugProbe, DebugProbeError, DebugProbeSelector, JtagChain, JtagChainAccess,
-        JtagChainState, ProbeFactory, WireProtocol,
-        cmsisdap::commands::{
-            CmsisDapError, RequestError,
-            general::info::{CapabilitiesCommand, PacketCountCommand, SWOTraceBufferSizeCommand},
+        JtagChainState, ProbeFactory, ResetLine, WireProtocol,
+        cmsisdap::{
+            arm::CmsisDapTransport,
+            commands::{
+                CmsisDapError, RequestError, SendError,
+                general::info::{
+                    CapabilitiesCommand, PacketCountCommand, SWOTraceBufferSizeCommand,
+                },
+            },
         },
         swd::SwdProbe,
     },
@@ -56,7 +64,7 @@ use commands::{
         sequence::{SequenceRequest, SequenceResponse},
     },
     swo,
-    transfer::{Ack, TransferRequest, configure::ConfigureRequest},
+    transfer::{Ack, TransferRequest, configure::ConfigureRequest, write_abort::WriteAbortRequest},
 };
 use probe_rs_target::ScanChainElement;
 
@@ -138,6 +146,9 @@ fn tcp_address(selector: &DebugProbeSelector) -> Option<&str> {
 }
 
 /// A CMSIS-DAP probe.
+///
+/// Reach one by downcasting [`Probe::driver_mut`](crate::probe::Probe::driver_mut) on an opened
+/// probe, or [`Session::driver_mut`](crate::Session::driver_mut) on an attached one.
 pub struct CmsisDap {
     device: CmsisDapDevice,
     _hw_version: u8,
@@ -158,6 +169,14 @@ pub struct CmsisDap {
     transfer_wait_retry: u16,
 
     jtag_state: JtagChainState,
+    reset_line: ResetLine,
+
+    /// Whether the probe got the scan chain with `DAP_JTAG_Configure` since it connected.
+    /// `DAP_Transfer` over JTAG needs it.
+    jtag_configured: bool,
+
+    /// The last value written to DP SELECT. Its DP bank decides what DP address 0x4 reaches.
+    dp_select: u32,
 }
 
 impl std::fmt::Debug for CmsisDap {
@@ -237,6 +256,9 @@ impl CmsisDap {
             speed_khz: 1_000,
             transfer_wait_retry: 0,
             jtag_state: JtagChainState::default(),
+            reset_line: ResetLine::default(),
+            jtag_configured: false,
+            dp_select: 0,
         })
     }
 
@@ -583,7 +605,39 @@ impl CmsisDap {
     }
 
     fn write_abort(&mut self, abort: Abort) -> Result<(), ArmError> {
-        let mut request = TransferRequest::write(Abort::ADDRESS, abort.into());
+        if self.protocol == Some(WireProtocol::Jtag) {
+            // A JTAG-DP has only DAPABORT, and clears its sticky flags through CTRL/STAT. The
+            // abort goes first, because CTRL/STAT answers WAIT while an AP transaction is stuck.
+            let value = u32::from(abort);
+            if value & 1 != 0 {
+                let request = WriteAbortRequest {
+                    dap_index: self.jtag_state.chain_params.index as u8,
+                    value: 1,
+                };
+                let response = commands::send_command(&mut self.device, &request)
+                    .map_err(DebugProbeError::from)?;
+                if response.status == Status::DapError {
+                    return Err(DebugProbeError::from(CmsisDapError::ErrorResponse(
+                        RequestError::WriteAbort { request },
+                    ))
+                    .into());
+                }
+            }
+            if value & !1 != 0 {
+                self.clear_jtag_sticky_err()?;
+            }
+            return Ok(());
+        }
+
+        self.write_dp_register(Abort::ADDRESS, abort.into())
+    }
+
+    fn write_dp_register(
+        &mut self,
+        address: DpRegisterAddress,
+        value: u32,
+    ) -> Result<(), ArmError> {
+        let mut request = TransferRequest::write(address, value);
         request.dap_index = self.jtag_state.chain_params.index as u8;
         let response =
             commands::send_command(&mut self.device, &request).map_err(DebugProbeError::from)?;
@@ -780,11 +834,15 @@ impl CmsisDap {
             .ok();
         }
         self.connected = true;
+        self.jtag_configured = false;
 
         Ok(())
     }
 
     pub(crate) fn configure_jtag(&mut self, skip_scan: bool) -> Result<(), DebugProbeError> {
+        // Until the new chain is in the probe, the old one may not describe the target.
+        self.jtag_configured = false;
+
         let ir_lengths = if skip_scan {
             let expected = self
                 .jtag_state
@@ -825,8 +883,42 @@ impl CmsisDap {
         };
         tracing::info!("Configuring JTAG with ir lengths: {:?}", ir_lengths);
         self.send_jtag_configure(JtagConfigureRequest::new(ir_lengths)?)?;
+        self.jtag_configured = true;
 
         Ok(())
+    }
+
+    /// Send a vendor command and return its response payload.
+    ///
+    /// The command ID and payload are defined by the probe firmware. The response excludes the
+    /// command ID and may include packet padding.
+    ///
+    /// The payload must fit in one packet, leaving one byte for the command ID. Callers must
+    /// interpret the response using the vendor's protocol, including any status bytes. A probe
+    /// that rejects the command with `ID_DAP_Invalid` returns
+    /// [`DebugProbeError::CommandNotSupportedByProbe`].
+    pub fn send_vendor_command(
+        &mut self,
+        command_id: VendorCommandId,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, DebugProbeError> {
+        commands::send_command(
+            &mut self.device,
+            &commands::VendorCommandRequest {
+                command_id,
+                payload,
+            },
+        )
+        .map_err(|error| match error {
+            // Firmware answers a command ID it has no handler for with `ID_DAP_Invalid` alone.
+            CmsisDapError::Send {
+                source: SendError::CommandIdMismatch(0xFF, _),
+                ..
+            } => DebugProbeError::CommandNotSupportedByProbe {
+                command_name: "vendor command",
+            },
+            error => error.into(),
+        })
     }
 }
 
@@ -917,6 +1009,7 @@ impl DebugProbe for CmsisDap {
         let _: Result<HostStatusResponse, _> = commands::send_command(&mut self.device, &request);
 
         self.connected = false;
+        self.jtag_configured = false;
 
         match response {
             DisconnectResponse(Status::DapOk) => Ok(()),
@@ -927,6 +1020,7 @@ impl DebugProbe for CmsisDap {
     }
 
     fn select_protocol(&mut self, protocol: WireProtocol) -> Result<(), DebugProbeError> {
+        self.jtag_configured = false;
         match protocol {
             WireProtocol::Jtag if self.capabilities.jtag_implemented => {
                 self.protocol = Some(WireProtocol::Jtag);
@@ -946,6 +1040,7 @@ impl DebugProbe for CmsisDap {
 
     /// Asserts the nRESET pin.
     fn target_reset(&mut self) -> Result<(), DebugProbeError> {
+        self.reset_line.check_assert()?;
         commands::send_command(&mut self.device, &ResetRequest).map(|v: ResetResponse| {
             tracing::info!("Target reset response: {:?}", v);
         })?;
@@ -953,6 +1048,7 @@ impl DebugProbe for CmsisDap {
     }
 
     fn target_reset_assert(&mut self) -> Result<(), DebugProbeError> {
+        self.reset_line.check_assert()?;
         let request = SWJPinsRequestBuilder::new().nreset(false).build();
 
         commands::send_command(&mut self.device, &request).map(|v: SWJPinsResponse| {
@@ -970,6 +1066,10 @@ impl DebugProbe for CmsisDap {
         Ok(())
     }
 
+    fn set_reset_line_connected(&mut self, connected: bool) {
+        self.reset_line.set_connected(connected);
+    }
+
     fn get_swo_interface(&self) -> Option<&dyn SwoAccess> {
         Some(self as _)
     }
@@ -982,20 +1082,11 @@ impl DebugProbe for CmsisDap {
         self: Box<Self>,
         sequence: Arc<dyn ArmDebugSequence>,
     ) -> Result<Box<dyn ArmDebugInterface + 'probe>, (Box<dyn DebugProbe>, ArmError)> {
-        match self.protocol {
-            Some(WireProtocol::Jtag) => {
-                let settings = SwdProbe::swd_settings(self.as_ref());
-                Ok(ArmCommunicationInterface::create_jtag(
-                    self, settings, sequence, false,
-                ))
-            }
-            _ => {
-                let settings = SwdProbe::swd_settings(self.as_ref());
-                Ok(ArmCommunicationInterface::create_swd(
-                    self, settings, sequence, false,
-                ))
-            }
-        }
+        Ok(ArmCommunicationInterface::create(
+            Box::new(CmsisDapTransport(self)),
+            sequence,
+            false,
+        ))
     }
 
     fn has_arm_interface(&self) -> bool {
@@ -1189,7 +1280,12 @@ mod tests {
         ignore_unknown_command,
     };
     use super::commands::{Request, general::info::PacketSizeCommand};
-    use super::{CapabilitiesCommand, CmsisDap, HostStatusResponse, PacketCountCommand};
+    use super::{
+        CapabilitiesCommand, CmsisDap, HostStatusResponse, PacketCountCommand, VendorCommandId,
+    };
+    use crate::probe::DebugProbeError;
+
+    const VENDOR_COMMAND: VendorCommandId = VendorCommandId::new(0x8F).unwrap();
 
     fn failed(source: SendError) -> Result<HostStatusResponse, CmsisDapError> {
         Err(CmsisDapError::Send {
@@ -1220,6 +1316,78 @@ mod tests {
             .is_err()
         );
         assert!(ignore_unknown_command(failed(SendError::Timeout)).is_err());
+    }
+
+    #[test]
+    fn vendor_command_sends_opaque_payload_and_returns_reply_bytes() {
+        let probe = FakeProbe::shared(64, |command| match command {
+            [0x8F, 0x12, 0x34, ..] => Reply::Now(vec![0x8F, 0xA5, 0, 0]),
+            command => standard_reply(command, 64, 4),
+        });
+        let mut dap = CmsisDap::new_from_device(CmsisDapDevice::Fake(probe.clone())).unwrap();
+
+        let response = dap
+            .send_vendor_command(VENDOR_COMMAND, &[0x12, 0x34])
+            .unwrap();
+
+        assert_eq!(response, [0xA5, 0, 0]);
+        assert_eq!(
+            probe.lock().unwrap().sent.last().unwrap(),
+            &[0x8F, 0x12, 0x34]
+        );
+    }
+
+    #[test]
+    fn a_vendor_payload_fills_at_most_one_packet() {
+        let probe = FakeProbe::shared(64, |command| match command {
+            [0x8F, ..] => Reply::Now(vec![0x8F]),
+            _ => standard_reply(command, 64, 4),
+        });
+        let mut dap = CmsisDap::new_from_device(CmsisDapDevice::Fake(probe.clone())).unwrap();
+        let sent = probe.lock().unwrap().sent.len();
+
+        assert!(
+            dap.send_vendor_command(VENDOR_COMMAND, &[0x55; 64])
+                .is_err()
+        );
+        assert_eq!(probe.lock().unwrap().sent.len(), sent);
+
+        dap.send_vendor_command(VENDOR_COMMAND, &[0x55; 63])
+            .unwrap();
+        assert_eq!(probe.lock().unwrap().sent.last().unwrap().len(), 64);
+    }
+
+    #[test]
+    fn a_vendor_command_the_firmware_rejects_is_unsupported() {
+        // The probe answers every command it does not know with `ID_DAP_Invalid`.
+        let probe = FakeProbe::shared(64, |command| standard_reply(command, 64, 4));
+        let mut dap = CmsisDap::new_from_device(CmsisDapDevice::Fake(probe)).unwrap();
+
+        assert!(matches!(
+            dap.send_vendor_command(VENDOR_COMMAND, &[]),
+            Err(DebugProbeError::CommandNotSupportedByProbe { .. })
+        ));
+    }
+
+    #[test]
+    fn an_arm_interface_lends_its_cmsis_dap_probe() {
+        use crate::architecture::arm::sequences::DefaultArmSequence;
+        use crate::probe::Probe;
+        use std::any::Any;
+
+        let probe = FakeProbe::shared(64, |command| match command {
+            [0x02, ..] => Reply::Now(vec![0x02, 1]),
+            [id @ (0x04 | 0x11 | 0x12 | 0x13), ..] => Reply::Now(vec![*id, 0]),
+            _ => standard_reply(command, 64, 4),
+        });
+        let mut probe = Probe::new(CmsisDap::new_from_device(CmsisDapDevice::Fake(probe)).unwrap());
+        probe.attach_to_unspecified().unwrap();
+        let mut interface = probe
+            .try_into_arm_debug_interface(DefaultArmSequence::create())
+            .unwrap_or_else(|_| panic!("no ARM interface"));
+
+        let probe: &mut dyn Any = interface.driver_mut().unwrap();
+        assert!(probe.downcast_mut::<CmsisDap>().is_some());
     }
 
     #[test]

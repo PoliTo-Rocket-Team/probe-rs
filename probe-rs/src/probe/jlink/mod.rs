@@ -42,7 +42,7 @@ use crate::{
     },
     probe::{
         BitbangSwd, DebugProbe, DebugProbeError, DebugProbeInfo, DebugProbeSelector,
-        IoSequenceItem, ProbeFactory, SwdProbe, SwdSettings, WireProtocol,
+        IoSequenceItem, ProbeFactory, ResetLine, SwdProbe, SwdSettings, WireProtocol,
         list::{ProbeListItem, usb_probe_accessibility},
         swd::{Pins, output_levels},
     },
@@ -192,7 +192,8 @@ impl ProbeFactory for JLinkFactory {
             speed_khz: 0, // default is unknown
             swd_settings: SwdSettings::default(),
             jtag_state: JtagChainState::default(),
-            force_legacy_jtag_command: selector.product_id == 0x0101,
+            reset_line: ResetLine::default(),
+            force_legacy_jtag_command: false,
 
             jtag_tms_bits: vec![],
             jtag_tdi_bits: vec![],
@@ -206,6 +207,11 @@ impl ProbeFactory for JLinkFactory {
         };
         this.fill_capabilities()?;
         this.fill_interfaces()?;
+
+        // 0x0101 is the default product ID of every J-Link in SEGGER's old USB format, so only the
+        // firmware string tells the probe of probe-rs/probe-rs#4066 apart from the rest.
+        this.force_legacy_jtag_command =
+            selector.product_id == 0x0101 && is_lite_firmware(&this.read_firmware_version()?);
 
         this.supported_protocols = if this.caps.contains(Capability::SelectIf) {
             this.interfaces
@@ -400,6 +406,8 @@ pub struct JLink {
     max_mem_block_size: usize,
 
     swd_settings: SwdSettings,
+
+    reset_line: ResetLine,
 }
 
 impl fmt::Debug for JLink {
@@ -737,7 +745,7 @@ impl JLink {
         self.require_interface_selected(Interface::Jtag)?;
 
         let mut has_status_byte = false;
-        // There's 3 commands for doing a JTAG transfer. The older 2 are obsolete with hardware
+        // There are 3 commands for doing a JTAG transfer. The older 2 are obsolete with hardware
         // version 5 and above, which adds the 3rd command. Unfortunately we cannot reliably use the
         // HW version to determine this since some embedded J-Link probes have a HW version of
         // 1.0.0, but still support SWD, so we use the `SELECT_IF` capability instead.
@@ -1099,11 +1107,13 @@ impl DebugProbe for JLink {
     }
 
     fn target_reset(&mut self) -> Result<(), DebugProbeError> {
+        self.reset_line.check_assert()?;
         self.write_cmd(&[Command::ResetTarget as u8])?;
         Ok(())
     }
 
     fn target_reset_assert(&mut self) -> Result<(), DebugProbeError> {
+        self.reset_line.check_assert()?;
         self.set_reset(false)?;
         Ok(())
     }
@@ -1111,6 +1121,10 @@ impl DebugProbe for JLink {
     fn target_reset_deassert(&mut self) -> Result<(), DebugProbeError> {
         self.set_reset(true)?;
         Ok(())
+    }
+
+    fn set_reset_line_connected(&mut self, connected: bool) {
+        self.reset_line.set_connected(connected);
     }
 
     fn try_as_jtag_chain(&mut self) -> Option<JtagChain<'_>> {
@@ -1230,6 +1244,7 @@ impl BitbangSwd for JLink {
         select: Pins,
         wait: Duration,
     ) -> Result<(), DebugProbeError> {
+        self.reset_line.check_pins(out, select)?;
         if select.ntrst() || select.tdi() || select.tdo() {
             Err(DebugProbeError::CommandNotSupportedByProbe {
                 command_name: "swj_pins",
@@ -1415,8 +1430,9 @@ impl HardwareVersion {
 
     /// The major version.
     fn major(&self) -> u8 {
-        // Decimal coded Decimal, cool cool
-        (self.0 / 10000) as u8
+        // Decimal coded Decimal, cool cool. The hardware type sits above this field, so it
+        // has to be divided out before the cast, which would otherwise truncate.
+        ((self.0 / 10000) % 100) as u8
     }
 
     /// The minor version.
@@ -1458,6 +1474,14 @@ impl fmt::Display for HardwareType {
             HardwareType::JLinkPro => "J-Link Pro",
         })
     }
+}
+
+/// Whether the firmware string names a J-Link Lite.
+///
+/// Only a J-Link ARM Lite V8 is known to need `HW_JTAG2`. The match takes any Lite, in any case,
+/// so that no untested variant changes command.
+fn is_lite_firmware(firmware_version: &str) -> bool {
+    firmware_version.to_ascii_lowercase().contains("lite")
 }
 
 const VID_SEGGER: u16 = 0x1366;
@@ -1544,6 +1568,8 @@ mod test {
                     command_name: "target_reset_assert",
                 })
             }
+
+            fn set_reset_line_connected(&mut self, _connected: bool) {}
 
             fn target_reset_deassert(&mut self) -> Result<(), crate::probe::DebugProbeError> {
                 Ok(())
@@ -1683,6 +1709,8 @@ mod test {
                 })
             }
 
+            fn set_reset_line_connected(&mut self, _connected: bool) {}
+
             fn target_reset_deassert(&mut self) -> Result<(), crate::probe::DebugProbeError> {
                 Ok(())
             }
@@ -1770,5 +1798,15 @@ mod test {
     fn jlink_pid_segger_driver() {
         // J-Link device using the legacy Segger driver.
         assert!(super::is_jlink_product_id(0x1059));
+    }
+
+    #[test]
+    fn a_version_above_the_hardware_type_field_is_not_truncated() {
+        // A J-Link Ultra reports 7040000, which SEGGER's own tools show as V4.00.
+        let version = super::HardwareVersion::from_u32(7_040_000);
+        assert_eq!(
+            (version.major(), version.minor(), version.revision()),
+            (4, 0, 0)
+        );
     }
 }

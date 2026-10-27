@@ -25,7 +25,7 @@ use crate::{
     core::{Architecture, CombinedCoreState},
     memory_port::MemoryAccessPort,
     probe::{
-        AttachMethod, DebugProbeError, Probe, ProbeCreationError, WireProtocol,
+        AttachMethod, DebugProbe, DebugProbeError, Probe, ProbeCreationError, WireProtocol,
         fake_probe::FakeProbe, list::Lister,
     },
 };
@@ -206,7 +206,7 @@ impl Session {
 
         // Use ARM DAP path when the target connects via SWD/DAP: either ARM cores or RISC-V cores
         // over mem-AP (e.g. RP235x_riscv).
-        let mut session = if target.default_core().memory_ap().is_some() {
+        let mut session = if target.uses_arm_debug_interface() {
             Self::attach_arm_debug_interface(probe, target, attach_method, permissions, cores)?
         } else {
             Self::attach_jtag(probe, target, attach_method, permissions, cores)?
@@ -880,6 +880,21 @@ impl Session {
         }
     }
 
+    /// Prepares the target before an image that boots from RAM is written.
+    pub(crate) fn prepare_loading_to_ram(&mut self) -> Result<(), crate::Error> {
+        match self.target.debug_sequence.clone() {
+            DebugSequence::Arm(arm_debug_sequence) => {
+                arm_debug_sequence.prepare_loading_to_ram(self)
+            }
+            DebugSequence::Riscv(riscv_debug_sequence) => {
+                riscv_debug_sequence.prepare_loading_to_ram(self)
+            }
+            DebugSequence::Xtensa(xtensa_debug_sequence) => {
+                xtensa_debug_sequence.prepare_loading_to_ram(self)
+            }
+        }
+    }
+
     /// Check if the connected device has a debug erase sequence defined
     pub fn has_sequence_erase_all(&self) -> bool {
         match &self.target.debug_sequence {
@@ -959,6 +974,20 @@ impl Session {
     /// Get the target description of the connected target.
     pub fn target(&self) -> &Target {
         &self.target
+    }
+
+    /// Returns the probe driver. Downcast it through [`Any`](std::any::Any) to use a specific
+    /// driver's own API.
+    ///
+    /// Commands sent through it reach the probe after everything the session did before.
+    /// Commands that reset or reconfigure the debug interface can invalidate the session's
+    /// cached state. Reattach before further target access after such a command.
+    pub fn driver_mut(&mut self) -> Option<&mut dyn DebugProbe> {
+        match &mut self.interfaces {
+            ArchitectureInterface::Arm(interface)
+            | ArchitectureInterface::ArmWithRiscv { arm: interface, .. } => interface.driver_mut(),
+            ArchitectureInterface::Jtag(probe, _) => Some(probe.driver_mut()),
+        }
     }
 
     /// Configure the target and probe for serial wire view (SWV) tracing.
@@ -1159,7 +1188,7 @@ fn get_target_from_selector(
 }
 
 /// The `Permissions` struct represents what a [Session] is allowed to do with a target.
-/// Some operations can be irreversible, so need to be explicitly allowed by the user.
+/// Some operations can be irreversible, so they need to be explicitly allowed by the user.
 ///
 /// # Example
 ///

@@ -1,4 +1,5 @@
 pub mod configure;
+pub mod write_abort;
 
 use std::iter;
 
@@ -258,7 +259,9 @@ impl TransferRequest {
 }
 
 impl Request for TransferRequest {
-    const COMMAND_ID: CommandId = CommandId::Transfer;
+    fn command(&self) -> CommandId {
+        CommandId::Transfer
+    }
 
     type Response = TransferResponse;
 
@@ -367,7 +370,9 @@ pub struct TransferBlockRequest {
 }
 
 impl Request for TransferBlockRequest {
-    const COMMAND_ID: CommandId = CommandId::TransferBlock;
+    fn command(&self) -> CommandId {
+        CommandId::TransferBlock
+    }
 
     type Response = TransferBlockResponse;
 
@@ -515,7 +520,9 @@ pub struct TransferBlockResponse {
 pub struct TransferAbortRequest;
 
 impl Request for TransferAbortRequest {
-    const COMMAND_ID: CommandId = CommandId::TransferAbort;
+    fn command(&self) -> CommandId {
+        CommandId::TransferAbort
+    }
 
     type Response = ();
 

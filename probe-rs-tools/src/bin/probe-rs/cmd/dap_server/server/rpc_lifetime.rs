@@ -66,7 +66,9 @@ impl DapRpcConnection {
 
     /// Close the RPC connection and wait for a local in-process server to exit.
     pub(crate) async fn close(mut self) {
-        self.client.take();
+        if let Some(client) = self.client.take() {
+            client.close().await;
+        }
         if let Some(handle) = self.local_server.take() {
             let _ = handle.await;
         }
@@ -147,6 +149,7 @@ mod tests {
             connect_under_reset: false,
             allow_erase_all: false,
             attach_timeout: None,
+            target_serial: false,
         };
 
         attach_probe(client, options, None, false).await?;

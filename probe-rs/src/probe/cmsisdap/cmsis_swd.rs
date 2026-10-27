@@ -564,6 +564,7 @@ impl CmsisDap {
         select: SwdPins,
         wait: Duration,
     ) -> Result<SwdPins, DebugProbeError> {
+        self.reset_line.check_pins(out, select)?;
         self.connect_if_needed()?;
 
         let request = commands::swj::pins::SWJPinsRequest::from_raw_values(
@@ -699,7 +700,7 @@ mod tests {
 
         let mut blocks = 0;
         let probe = FakeProbe::shared(64, move |command| {
-            if command[0] != CommandId::TransferBlock as u8 {
+            if command[0] != CommandId::TransferBlock.id() {
                 return standard_reply(command, 64, 4);
             }
             let count = u16::from_le_bytes([command[2], command[3]]);

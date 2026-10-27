@@ -78,8 +78,8 @@ pub enum SelectProbeResult {
 pub type SelectProbeResponse = RpcResult<SelectProbeResult>;
 
 #[derive(Serialize, Deserialize, Schema)]
-pub enum AttachResult {
-    Success(Key<Session>),
+pub enum AttachResult<T = Key<Session>> {
+    Success(T),
     ProbeNotFound,
     FailedToOpenProbe(String),
     ProbeInUse,
@@ -123,6 +123,8 @@ pub struct AttachRequest {
     pub allow_erase_all: bool,
     pub resume_target: bool,
     pub wait_for_probe: Option<Duration>,
+    /// Open the serial port to the target.
+    pub target_serial: bool,
 }
 
 pub type AttachResponse = RpcResult<AttachResult>;

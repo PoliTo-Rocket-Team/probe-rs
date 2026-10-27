@@ -26,9 +26,9 @@ use crate::rpc::{
         },
         info::{target_info, target_metadata},
         memory::{read_bytes, read_memory, write_memory},
-        monitor::monitor,
+        monitor::{monitor, write_serial},
         probe::{attach, list_probes, select_probe},
-        reset::{reset, reset_and_halt},
+        reset::{reset, reset_and_halt, reset_target},
         rtt_client::{
             clean_up_rtt, clear_rtt_control_block, create_rtt_client, get_rtt_channels,
             poll_rtt_up, write_rtt_down,
@@ -89,7 +89,7 @@ pub(crate) trait MultiTopicWriter {
     type Sender: Send + 'static;
     type Publisher: MultiTopicPublisher;
 
-    fn create(token: CancellationToken) -> (Self::Sender, Self::Publisher);
+    fn create() -> (Self::Sender, Self::Publisher);
 }
 
 impl<T> MultiTopicWriter for T
@@ -100,9 +100,9 @@ where
     type Sender = Sender<T::Message>;
     type Publisher = TopicPublisher<T>;
 
-    fn create(token: CancellationToken) -> (Self::Sender, Self::Publisher) {
+    fn create() -> (Self::Sender, Self::Publisher) {
         let (tx, rx) = channel::<T::Message>(256);
-        (tx, TopicPublisher { rx, token })
+        (tx, TopicPublisher { rx })
     }
 }
 
@@ -116,7 +116,6 @@ where
     T::Message: Serialize + Sized + Send + 'static,
 {
     rx: Receiver<T::Message>,
-    token: CancellationToken,
 }
 
 impl<T> MultiTopicPublisher for TopicPublisher<T>
@@ -125,19 +124,12 @@ where
     T::Message: Serialize + Sized + Send + 'static,
 {
     async fn publish(mut self, sender: &PostcardSender<WireTxImpl>) {
-        loop {
-            tokio::select! {
-                biased;
-
-                _ = self.token.cancelled() => break,
-                event = self.rx.recv() => {
-                    // The task has dropped its sender, and everything it sent is published.
-                    let Some(event) = event else { break };
-                    sender
-                        .publish::<T>(VarSeq::Seq2(0), &event)
-                        .await
-                        .unwrap();
-                }
+        // Run until the task drops its sender, also after a cancel, so that its last events reach
+        // the client.
+        while let Some(event) = self.rx.recv().await {
+            if sender.publish::<T>(VarSeq::Seq2(0), &event).await.is_err() {
+                tracing::debug!("Client is gone, dropping the events of {}", T::PATH);
+                break;
             }
         }
     }
@@ -181,9 +173,10 @@ impl RpcSpawnContext {
     pub(crate) async fn set_session(
         &self,
         session: probe_rs::Session,
+        target_serial: Option<crate::rpc::SharedTargetSerial>,
         lease: crate::rpc::probe_broker::ProbeLease,
     ) -> Key<Session> {
-        self.state.set_session(session, lease).await
+        self.state.set_session(session, target_serial, lease).await
     }
 
     pub async fn run_blocking<T, F, REQ, RESP>(&mut self, request: REQ, task: F) -> RESP
@@ -194,8 +187,7 @@ impl RpcSpawnContext {
         REQ: Send + 'static,
         RESP: Send + 'static,
     {
-        let token = self.cancellation_token();
-        let (sender, publisher) = T::create(token);
+        let (sender, publisher) = T::create();
 
         let ctx = self.clone();
         let blocking = tokio::task::spawn_blocking(move || task(ctx, request, sender));
@@ -299,13 +291,20 @@ impl SpawnContext for RpcContext {
     type SpawnCtxt = RpcSpawnContext;
 
     fn spawn_ctxt(&mut self) -> Self::SpawnCtxt {
-        self.state.token = CancellationToken::new();
         RpcSpawnContext {
             state: self.state.clone(),
             sender: self.sender.clone().unwrap(),
             probe_broker: self.probe_broker.clone(),
             lister: self.lister.clone(),
         }
+    }
+}
+
+impl Drop for RpcContext {
+    fn drop(&mut self) {
+        // The connection is gone. Stop its requests, so that they release the session and the
+        // probe lease.
+        self.state.token.cancel();
     }
 }
 
@@ -366,6 +365,11 @@ impl RpcContext {
         })
     }
 
+    /// Returns the serial port to the target of a session.
+    pub fn target_serial(&self, sid: Key<Session>) -> Option<crate::rpc::SharedTargetSerial> {
+        self.state.target_serial(sid)
+    }
+
     pub fn debug_states(&self) -> DebugStatesMap {
         self.state.debug_states.clone()
     }
@@ -423,7 +427,22 @@ async fn cancel_handler(
     _msg: (),
     _sender: &PostcardSender<WireTxImpl>,
 ) {
-    ctx.state.token.cancel();
+    // Stop all running requests. Requests that start later get a new token.
+    std::mem::take(&mut ctx.state.token).cancel();
+}
+
+/// Sends the reply of a spawned handler.
+pub(crate) async fn reply<E>(
+    sender: &PostcardSender<WireTxImpl>,
+    header: VarHeader,
+    resp: &E::Response,
+) where
+    E: postcard_rpc::Endpoint,
+    E::Response: Serialize + Schema,
+{
+    if sender.reply::<E>(header.seq_no, resp).await.is_err() {
+        tracing::debug!("Client is gone, dropping the reply of {}", E::PATH);
+    }
 }
 
 pub fn spawn_fn(
@@ -488,6 +507,7 @@ postcard_rpc::define_dispatch! {
         | BootEndpoint                     | async | boot                       |
         | MonitorEndpoint                  | spawn | monitor                    |
         | RttDownEndpoint                  | async | write_rtt_down             |
+        | SerialWriteEndpoint              | async | write_serial               |
         | GetRttChannelsEndpoint           | async | get_rtt_channels           |
         | PollRttUpEndpoint                | async | poll_rtt_up                |
         | CleanUpRttEndpoint               | async | clean_up_rtt               |
@@ -508,6 +528,7 @@ postcard_rpc::define_dispatch! {
         | TargetInfoEndpoint               | async | target_info                |
         | ResetCoreEndpoint                | async | reset                      |
         | ResetCoreAndHaltEndpoint         | async | reset_and_halt             |
+        | ResetTargetEndpoint              | spawn | reset_target               |
 
         | CoreStatusEndpoint               | async | core_status                |
         | CoreHaltEndpoint                 | async | core_halt                  |
@@ -706,5 +727,72 @@ mod tests {
 
         drop(ctx);
         assert_eq!(frames.await.unwrap(), EVENTS);
+    }
+
+    /// The client can go away while a task publishes events. The server must
+    /// not panic.
+    #[tokio::test]
+    async fn run_blocking_survives_a_closed_connection() {
+        let (wire_tx, wire_rx) = channel::<Vec<u8>>(1);
+        drop(wire_rx);
+
+        let mut ctx = RpcSpawnContext {
+            state: ConnectionState::new(),
+            sender: PostcardSender::new(WireTx::new(wire_tx), VarKeyKind::Key4),
+            probe_broker: Arc::new(ProbeBroker::new()),
+            lister: Arc::new(LimitedLister::new(ProbeAccess::All)),
+        };
+        let result = tokio::spawn(async move {
+            ctx.run_blocking::<RttTopic, _, _, _>((), |_, (), sender| {
+                let event = RttEvent::Output {
+                    channel: 0,
+                    bytes: vec![0],
+                };
+                _ = sender.blocking_send(event);
+            })
+            .await
+        })
+        .await;
+
+        assert!(result.is_ok(), "run_blocking panicked");
+    }
+
+    /// A task can send events after a cancel, for example the RTT output of
+    /// its last poll. The publisher must forward them.
+    #[tokio::test]
+    async fn run_blocking_publishes_events_sent_after_a_cancel() {
+        let (wire_tx, mut wire_rx) = channel::<Vec<u8>>(16);
+        let frames = tokio::spawn(async move {
+            let mut frames = 0;
+            while wire_rx.recv().await.is_some() {
+                frames += 1;
+            }
+            frames
+        });
+
+        let mut ctx = RpcSpawnContext {
+            state: ConnectionState::new(),
+            sender: PostcardSender::new(WireTx::new(wire_tx), VarKeyKind::Key4),
+            probe_broker: Arc::new(ProbeBroker::new()),
+            lister: Arc::new(LimitedLister::new(ProbeAccess::All)),
+        };
+        let token = ctx.cancellation_token();
+
+        let sent = ctx
+            .run_blocking::<RttTopic, _, _, _>((), move |_, (), sender| {
+                token.cancel();
+                // Give the publisher time to see the cancel.
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                let event = RttEvent::Output {
+                    channel: 0,
+                    bytes: vec![0],
+                };
+                sender.blocking_send(event).is_ok()
+            })
+            .await;
+
+        drop(ctx);
+        assert!(sent, "the publisher stopped at the cancel");
+        assert_eq!(frames.await.unwrap(), 1);
     }
 }

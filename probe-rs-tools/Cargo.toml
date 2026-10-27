@@ -62,7 +62,7 @@ indicatif = "0.18"
 insta = { version = "1.38", default-features = false, features = ["yaml"] }
 itm = { version = "0.9.0-rc.1", default-features = false }
 parse_int = "0.9"
-libtest-mimic = "0.8.0"
+libtest-mimic = "0.8.2"
 fastrand = "2.1"
 object = { version = "0.40", default-features = false, features = [
     "elf",
@@ -92,7 +92,7 @@ ratatui = { version = "0.30.0", default-features = false, features = [
 ansi-parser = "0.9.0"
 linkme = "0.3.25"
 
-parking_lot = "0.12.2"
+parking_lot = "0.13.0"
 toml = "1.0"
 clap_complete = "4.5.2"
 regex = "1.10.4"
@@ -141,6 +141,7 @@ git-version = "0.3"
 [dev-dependencies]
 pretty_assertions = "1.4.0"
 test-case = "3"
+tokio-tungstenite = "0.30"
 probe-rs = { version = "0.32.0", path = "../probe-rs", features = ["test"] }
 
 # Set the proper name for the homebrew formula

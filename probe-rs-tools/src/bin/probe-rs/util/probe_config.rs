@@ -1,10 +1,15 @@
 //! The probe table of the configuration file: settings for each probe.
 
-use std::collections::HashMap;
+use std::{any::Any, collections::HashMap};
 
+use anyhow::Context as _;
 use probe_rs::probe::{
     DebugProbeError, DebugProbeSelector, Probe, WireProtocol,
+    ch347::{Ch347, Ch347Config},
+    ftdi::{FtdiConfig, FtdiProbe},
     list::{ProbeListItem, ProbeLister},
+    target_serial::{HostSerialPort, LineState, PortSelector, SerialSettings, TargetSerial},
+    usb_util::UsbSerialFilter,
 };
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -15,6 +20,23 @@ use serde::{Deserialize, Deserializer, Serialize};
 /// [probes."0403:6010-1"]
 /// speed = 4000
 /// protocol = "swd"
+///
+/// [probes."1a86:55dd"]
+/// protocol = "swd"
+/// reset_line_connected = true
+///
+/// [probes."1a86:55dd".driver]
+/// type = "ch347"
+/// reset_pin = "trst"
+///
+/// [probes."0403:6010".driver]
+/// type = "ftdi"
+/// uart = "b"
+/// uart_reset = "esp"
+///
+/// [probes."0403:6010-1".serial]
+/// usb = "1a86:7523"
+/// baud = 921600
 /// ```
 #[derive(Debug, Default, Clone, Serialize)]
 #[serde(transparent)]
@@ -55,6 +77,143 @@ pub struct ProbeConfig {
     /// The wire protocol, if the command does not set it.
     #[serde(deserialize_with = "deserialize_protocol")]
     pub protocol: Option<WireProtocol>,
+    /// The reset line of the probe is connected to the target's nRESET. `probe-rs reset` then uses a
+    /// pin reset. The other commands use a pin reset only on request, for example for connect under
+    /// reset. If `false`, probe-rs does not assert the reset line, and operations that need a pin
+    /// reset fail.
+    /// A WCH-LinkE or WCH-LinkW resets with its RST pin only if this is `true`.
+    pub reset_line_connected: Option<bool>,
+    /// Settings of the probe driver.
+    pub driver: Option<DriverConfig>,
+    /// The serial port to the target.
+    pub serial: SerialConfig,
+}
+
+/// Settings of one probe driver. `type` selects the driver.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum DriverConfig {
+    Ch347(Ch347Config),
+    Ftdi(FtdiConfig),
+}
+
+impl DriverConfig {
+    /// Applies the settings to `probe`. Call this before attach.
+    pub fn apply(&self, probe: &mut Probe) -> Result<(), DebugProbeError> {
+        let probe_name = probe.get_name();
+        let mismatch = || {
+            DebugProbeError::Other(format!(
+                "The driver settings are for a {}, but the probe is a {probe_name}",
+                self.driver_name(),
+            ))
+        };
+        match self {
+            DriverConfig::Ch347(config) => (probe.driver_mut() as &mut dyn Any)
+                .downcast_mut::<Ch347>()
+                .ok_or_else(mismatch)?
+                .configure(config),
+            DriverConfig::Ftdi(config) => (probe.driver_mut() as &mut dyn Any)
+                .downcast_mut::<FtdiProbe>()
+                .ok_or_else(mismatch)?
+                .configure(config),
+        }
+    }
+
+    fn driver_name(&self) -> &'static str {
+        match self {
+            DriverConfig::Ch347(_) => "CH347",
+            DriverConfig::Ftdi(_) => "FTDI",
+        }
+    }
+}
+
+/// Settings of the serial port to the target. A `None` field keeps the driver default.
+///
+/// The machine with the probe owns these settings. In remote mode, the client can only ask for
+/// the port.
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SerialConfig {
+    /// `false` never opens the port.
+    pub enabled: Option<bool>,
+    pub baud: Option<u32>,
+    pub dtr: Option<LineState>,
+    pub rts: Option<LineState>,
+    /// Use this USB serial port instead of the port of the probe: `VID:PID[:serial]`.
+    pub usb: Option<String>,
+    /// Use the serial port with this OS name instead of the port of the probe, for example `COM7`
+    /// or `/dev/ttyAMA0`.
+    pub port: Option<String>,
+}
+
+impl SerialConfig {
+    /// Sets the fields of `self` that `other` sets.
+    fn merge(&mut self, other: &SerialConfig) {
+        let other = other.clone();
+        self.enabled = other.enabled.or(self.enabled);
+        self.baud = other.baud.or(self.baud);
+        self.dtr = other.dtr.or(self.dtr);
+        self.rts = other.rts.or(self.rts);
+        // A replacement port is one setting: `usb` and `port` replace each other.
+        if other.usb.is_some() || other.port.is_some() {
+            self.usb = other.usb;
+            self.port = other.port;
+        }
+    }
+
+    fn apply(&self, settings: &mut SerialSettings) {
+        if let Some(baud) = self.baud {
+            settings.baud = baud;
+        }
+        if let Some(dtr) = self.dtr {
+            settings.dtr = dtr;
+        }
+        if let Some(rts) = self.rts {
+            settings.rts = rts;
+        }
+    }
+
+    /// The replacement port, if the config names one.
+    fn replacement(&self) -> anyhow::Result<Option<PortSelector>> {
+        if let Some(port) = &self.port {
+            return Ok(Some(PortSelector::Name(port.clone())));
+        }
+        let Some(usb) = &self.usb else {
+            return Ok(None);
+        };
+        let selector = usb
+            .parse::<DebugProbeSelector>()
+            .with_context(|| format!("Invalid serial port `{usb}`"))?;
+        Ok(Some(PortSelector::Usb(UsbSerialFilter {
+            vendor_id: Some(selector.vendor_id),
+            product_id: Some(selector.product_id),
+            serial_number: selector.serial_number,
+            interface: selector.interface,
+        })))
+    }
+
+    /// Takes the serial port to the target from `probe`, or the replacement port, and returns it
+    /// with its settings. Returns `None` if there is no port or the config disables it.
+    pub fn target_serial(
+        &self,
+        probe: &mut Probe,
+    ) -> anyhow::Result<Option<(Box<dyn TargetSerial>, SerialSettings)>> {
+        if self.enabled == Some(false) {
+            return Ok(None);
+        }
+
+        let serial: Box<dyn TargetSerial> = match self.replacement()? {
+            Some(port) => Box::new(HostSerialPort::new(port, SerialSettings::default())),
+            None => match probe.target_serial() {
+                Some(serial) => serial,
+                None => return Ok(None),
+            },
+        };
+
+        let mut settings = serial.default_settings();
+        self.apply(&mut settings);
+        Ok(Some((serial, settings)))
+    }
 }
 
 fn deserialize_protocol<'de, D>(deserializer: D) -> Result<Option<WireProtocol>, D::Error>
@@ -71,6 +230,12 @@ impl ProbeConfig {
     fn merge(&mut self, other: &ProbeConfig) {
         self.speed = other.speed.or(self.speed);
         self.protocol = other.protocol.or(self.protocol);
+        self.reset_line_connected = other.reset_line_connected.or(self.reset_line_connected);
+        // Driver settings are one setting.
+        if other.driver.is_some() {
+            self.driver = other.driver.clone();
+        }
+        self.serial.merge(&other.serial);
     }
 }
 
@@ -142,6 +307,12 @@ impl<L: ProbeLister> ProbeLister for ConfiguredLister<L> {
         }
 
         let config = self.configs.resolve(&self.complete_selector(selector));
+        if let Some(driver) = &config.driver {
+            driver.apply(&mut probe)?;
+        }
+        if let Some(connected) = config.reset_line_connected {
+            probe.set_reset_line_connected(connected);
+        }
         if let Some(protocol) = config.protocol {
             probe.select_protocol(protocol)?;
         }
@@ -271,6 +442,57 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn driver_settings_replace_each_other() {
+        let configs = configs(
+            r#"
+            ["1a86:55dd".driver]
+            type = "ch347"
+            reset_pin = "trst"
+
+            ["1a86:55dd:ABC".driver]
+            type = "ch347"
+            "#,
+        );
+
+        let config = configs.resolve(&probe("1a86:55dd:ABC"));
+        assert_eq!(
+            config.driver,
+            Some(DriverConfig::Ch347(Ch347Config::default()))
+        );
+    }
+
+    #[test]
+    fn invalid_driver_settings_are_rejected() {
+        assert!(is_rejected(
+            r#"
+            ["0403:6010".driver]
+            type = "jlink"
+            "#
+        ));
+        assert!(is_rejected(
+            r#"
+            ["0403:6010".driver]
+            type = "ftdi"
+            uart = "e"
+            "#
+        ));
+        assert!(is_rejected(
+            r#"
+            ["1a86:55dd".driver]
+            type = "ch347"
+            reset_pin = "gpio8"
+            "#
+        ));
+        assert!(is_rejected(
+            r#"
+            ["1a86:55dd".driver]
+            type = "ch347"
+            reset = "trst"
+            "#
+        ));
+    }
+
     #[derive(Debug, Default)]
     struct OneProbeLister {
         list_calls: Cell<usize>,
@@ -311,6 +533,27 @@ mod tests {
     }
 
     #[test]
+    fn unconnected_reset_line_refuses_connect_under_reset() {
+        let configs = configs(
+            r#"
+            ["0012:0023"]
+            reset_line_connected = false
+            "#,
+        );
+        let lister = ConfiguredLister::new(OneProbeLister::default(), configs);
+
+        let mut probe = lister.open(&probe("0012:0023")).unwrap();
+        assert!(matches!(
+            probe.attach_to_unspecified_under_reset(),
+            Err(probe_rs::Error::Arm(
+                probe_rs::architecture::arm::ArmError::Probe(
+                    DebugProbeError::ResetLineNotConnected
+                )
+            ))
+        ));
+    }
+
+    #[test]
     fn lister_lists_only_for_entries_with_a_serial_number() {
         let configs = configs(
             r#"
@@ -343,5 +586,41 @@ mod tests {
         assert!(configs.needs_serial_number(&probe("0012:0023")));
         assert!(!configs.needs_serial_number(&probe("0012:0023:ABC")));
         assert!(!configs.needs_serial_number(&probe("0012:0024")));
+    }
+
+    #[test]
+    fn serial_settings_merge_and_apply() {
+        let configs = configs(
+            r#"
+            ["303a:1001".serial]
+            baud = 9600
+            dtr = "low"
+            usb = "1a86:7523"
+
+            ["303a:1001:ABC".serial]
+            dtr = "high"
+            port = "COM7"
+            "#,
+        );
+
+        let serial = configs.resolve(&probe("303a:1001:ABC")).serial;
+        let mut settings = SerialSettings::default();
+        serial.apply(&mut settings);
+        assert_eq!(settings.baud, 9600);
+        assert_eq!(settings.dtr, LineState::High);
+        assert_eq!(settings.rts, LineState::Keep);
+
+        // The specific entry replaces the replacement port of the general entry.
+        assert_eq!(
+            serial.replacement().unwrap(),
+            Some(PortSelector::Name("COM7".to_string()))
+        );
+
+        let serial = configs.resolve(&probe("303a:1001:OTHER")).serial;
+        let Some(PortSelector::Usb(filter)) = serial.replacement().unwrap() else {
+            panic!("Expected a USB port");
+        };
+        assert_eq!(filter.vendor_id, Some(0x1a86));
+        assert_eq!(filter.product_id, Some(0x7523));
     }
 }

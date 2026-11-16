@@ -2,6 +2,7 @@
 
 mod bits;
 pub mod capabilities;
+mod cjtag;
 mod config;
 mod connection;
 mod error;
@@ -20,6 +21,7 @@ use nusb::{DeviceInfo, MaybeFuture, descriptors::TransferType, transfer::Directi
 
 use self::bits::BitIter;
 use self::capabilities::{Capabilities, Capability};
+use self::cjtag::CJtag;
 use self::error::JlinkError;
 use self::interface::{Interface, Interfaces};
 use self::speed::SpeedConfig;
@@ -42,7 +44,7 @@ use crate::{
     },
     probe::{
         BitbangSwd, DebugProbe, DebugProbeError, DebugProbeInfo, DebugProbeSelector,
-        IoSequenceItem, ProbeFactory, ResetLine, SwdProbe, SwdSettings, WireProtocol,
+        IoSequenceItem, ProbeFactory, ResetLine, SwdProbe, SwdSettings, UsbSelector, WireProtocol,
         list::{ProbeListItem, usb_probe_accessibility},
         swd::{Pins, output_levels},
     },
@@ -50,6 +52,13 @@ use crate::{
 
 const SWO_BUFFER_SIZE: u16 = 128;
 const TIMEOUT_DEFAULT: Duration = Duration::from_millis(500);
+
+/// Times the first command of a session is sent while the probe refuses it. Covers a command an
+/// earlier host left running.
+const MAX_OPEN_ATTEMPTS: usize = 8;
+
+/// How long the probe has to stay silent before an earlier host's reply counts as collected.
+const STALE_REPLY_IDLE: Duration = Duration::from_millis(50);
 
 /// Factory to create [`JLink`] probes.
 #[derive(Debug)]
@@ -63,6 +72,8 @@ impl std::fmt::Display for JLinkFactory {
 
 impl ProbeFactory for JLinkFactory {
     fn open(&self, selector: &DebugProbeSelector) -> Result<Box<dyn DebugProbe>, DebugProbeError> {
+        let DebugProbeSelector::Usb(selector) = selector;
+
         fn open_error(e: std::io::Error, while_: &'static str) -> DebugProbeError {
             let help = if cfg!(windows) {
                 "(this error may be caused by not having the WinUSB driver installed; use Zadig (https://zadig.akeo.ie/) to install it for the J-Link device; this will replace the SEGGER J-Link driver)"
@@ -194,6 +205,7 @@ impl ProbeFactory for JLinkFactory {
             jtag_state: JtagChainState::default(),
             reset_line: ResetLine::default(),
             force_legacy_jtag_command: false,
+            cjtag: CJtag::new(),
 
             jtag_tms_bits: vec![],
             jtag_tdi_bits: vec![],
@@ -262,7 +274,7 @@ impl ProbeFactory for JLinkFactory {
         // `read_max_mem_block`'s return value does not directly correspond to the
         // maximum transfer size when performing JTAG IO, and it's not clear how to get the actual value.
         // The number of *bits* is encoded as a u16, so the maximum value is 65535
-        this.jtag_chunk_size = match selector.product_id {
+        let jtag_chunk_size = match selector.product_id {
             // 0x0101: J-Link EDU
             0x0101 => 65535,
             // 0x1051: J-Link OB-K22-SiFive: 504 bits
@@ -270,6 +282,10 @@ impl ProbeFactory for JLinkFactory {
             // Assume the lowest value is a safe default
             _ => 504,
         };
+        // The command must still fit the probe's buffer, as for SWD IO: the J-Link EDU Mini,
+        // also 0x0101, has 11608 bytes, takes 46424 bits and fails 46480 bits with status 6.
+        this.jtag_chunk_size =
+            jtag_chunk_size.min(this.max_mem_block_size.saturating_sub(4) / 2 * 8);
         this.config = this.read_device_config()?;
         this.connection_handle = if requires_connection_handle(selector) {
             Some(this.register_connection()?)
@@ -285,7 +301,7 @@ impl ProbeFactory for JLinkFactory {
     }
 }
 
-fn requires_connection_handle(selector: &DebugProbeSelector) -> bool {
+fn requires_connection_handle(selector: &UsbSelector) -> bool {
     // These devices require a connection handle to be registered before they can be used.
     // As some other devices can't handle the registration command, we only enable it for known
     // devices.
@@ -357,6 +373,9 @@ enum Command {
 
     ReadConfig = 0xF2,
     WriteConfig = 0xF3,
+
+    /// Undocumented, observed in the traffic of the J-Link DLL (V8.44).
+    CJtagConfig = 0x0E,
 }
 
 /// A J-Link probe.
@@ -397,6 +416,9 @@ pub struct JLink {
     jtag_state: JtagChainState,
     force_legacy_jtag_command: bool,
 
+    /// 2-pin cJTAG (OScan1) instead of 4-pin JTAG.
+    cjtag: CJtag,
+
     /// max number of bits in a transfer chunk, when using JTAG
     jtag_chunk_size: usize,
 
@@ -422,9 +444,9 @@ impl JLink {
         self.caps
     }
 
-    /// Reads the advertised capabilities from the device.
+    /// Reads the advertised capabilities from the device. This is the first command of a session.
     fn fill_capabilities(&mut self) -> Result<(), JlinkError> {
-        self.write_cmd(&[Command::GetCaps as u8])?;
+        self.write_first_cmd(&[Command::GetCaps as u8])?;
 
         let caps = self.read_u32().map(Capabilities::from_raw_legacy)?;
 
@@ -483,6 +505,53 @@ impl JLink {
             )));
         }
         Ok(())
+    }
+
+    /// Sends a session's first command, collecting any reply an earlier host left unread.
+    ///
+    /// The probe accepts no command until the reply to the previous one has been read. A host
+    /// that exits with a command in flight leaves the probe refusing every write until it gives
+    /// up on that reply, seconds later.
+    fn write_first_cmd(&self, cmd: &[u8]) -> Result<(), JlinkError> {
+        let mut attempt = 1;
+        loop {
+            let timeout = match self.write_cmd(cmd) {
+                Err(JlinkError::Usb(e)) if e.kind() == std::io::ErrorKind::TimedOut => e,
+                result => return result,
+            };
+            if attempt == MAX_OPEN_ATTEMPTS {
+                return Err(JlinkError::BusyAtOpen(timeout));
+            }
+            if attempt == 1 {
+                tracing::warn!(
+                    "The J-Link did not accept the first command of this session. It is probably \
+                     still busy with a command from a previous session; discarding that \
+                     session's reply and retrying."
+                );
+            }
+            match self.discard_input(STALE_REPLY_IDLE) {
+                0 => tracing::debug!(
+                    "No reply yet from the previous session's command \
+                     (attempt {attempt} of {MAX_OPEN_ATTEMPTS})"
+                ),
+                n => tracing::debug!(
+                    "Discarded {n} bytes of a previous session's reply \
+                     (attempt {attempt} of {MAX_OPEN_ATTEMPTS})"
+                ),
+            }
+            attempt += 1;
+        }
+    }
+
+    /// Reads and discards whatever the probe sends until it has been silent for `idle`, and
+    /// returns how many bytes that was.
+    fn discard_input(&self, idle: Duration) -> usize {
+        let mut buf = vec![0; self.max_read_ep_packet];
+        let mut total = 0;
+        while let Ok(n @ 1..) = self.handle.read_bulk(self.read_ep, &mut buf, idle) {
+            total += n;
+        }
+        total
     }
 
     fn read(&self, buf: &mut [u8]) -> Result<(), JlinkError> {
@@ -625,10 +694,28 @@ impl JLink {
         self.read_u32().map(HardwareVersion::from_u32)
     }
 
+    fn select_protocol_interface(&mut self) -> Result<(), DebugProbeError> {
+        if self.caps.contains(Capability::SelectIf) {
+            let jlink_interface = self.jtag_interface(self.protocol);
+
+            self.select_interface(jlink_interface)?;
+        }
+        Ok(())
+    }
+
+    /// The J-Link interface for `protocol`.
+    fn jtag_interface(&self, protocol: WireProtocol) -> Interface {
+        match protocol {
+            WireProtocol::Swd => Interface::Swd,
+            WireProtocol::Jtag => Interface::Jtag,
+            WireProtocol::CJtag => Interface::CJtag,
+        }
+    }
+
     /// Selects the interface to use for talking to the target MCU.
     ///
-    /// Switching interfaces will reset the configured transfer speed, so [`JLink::set_speed`]
-    /// needs to be called *after* `select_interface`.
+    /// Switching interfaces resets the transfer speed on the probe, so a speed previously
+    /// configured with [`JLink::set_speed`] is re-applied after the switch.
     ///
     /// This requires the probe to support [`Capability::SelectIf`].
     ///
@@ -726,10 +813,17 @@ impl JLink {
         tdi: bool,
         capture: bool,
     ) -> Result<(), DebugProbeError> {
+        if self.interface == Interface::CJtag && !self.cjtag_keep(tms, capture) {
+            return Ok(());
+        }
+
         self.jtag_tms_bits.push(tms);
         self.jtag_tdi_bits.push(tdi);
         self.jtag_capture_tdo.push(capture);
 
+        if self.interface == Interface::CJtag {
+            self.cjtag_after_shift()?;
+        }
         if self.jtag_tms_bits.len() >= self.jtag_chunk_size {
             self.flush_jtag()?;
         }
@@ -742,7 +836,9 @@ impl JLink {
             return Ok(());
         }
 
-        self.require_interface_selected(Interface::Jtag)?;
+        if self.interface != Interface::CJtag {
+            self.require_interface_selected(Interface::Jtag)?;
+        }
 
         let mut has_status_byte = false;
         // There are 3 commands for doing a JTAG transfer. The older 2 are obsolete with hardware
@@ -984,10 +1080,7 @@ impl JLink {
 impl DebugProbe for JLink {
     fn select_protocol(&mut self, protocol: WireProtocol) -> Result<(), DebugProbeError> {
         if self.caps.contains(Capability::SelectIf) {
-            let jlink_interface = match protocol {
-                WireProtocol::Swd => Interface::Swd,
-                WireProtocol::Jtag => Interface::Jtag,
-            };
+            let jlink_interface = self.jtag_interface(protocol);
 
             if !self.interfaces.contains(jlink_interface) {
                 return Err(DebugProbeError::UnsupportedProtocol(protocol));
@@ -1021,6 +1114,9 @@ impl DebugProbe for JLink {
             return Err(DebugProbeError::UnsupportedSpeed(speed_khz));
         }
 
+        // GetSpeeds reports the speeds of the active interface.
+        self.select_protocol_interface()?;
+
         if let Ok(speeds) = self.read_interface_speeds() {
             tracing::debug!("Supported speeds: {:?}", speeds);
 
@@ -1046,14 +1142,7 @@ impl DebugProbe for JLink {
 
         tracing::debug!("Attaching with protocol '{}'", self.protocol);
 
-        if self.caps.contains(Capability::SelectIf) {
-            let jlink_interface = match self.protocol {
-                WireProtocol::Swd => Interface::Swd,
-                WireProtocol::Jtag => Interface::Jtag,
-            };
-
-            self.select_interface(jlink_interface)?;
-        }
+        self.select_protocol_interface()?;
 
         // Log some information about the probe
         tracing::debug!("J-Link: Capabilities: {:?}", self.caps);
@@ -1076,7 +1165,7 @@ impl DebugProbe for JLink {
         }
 
         match self.protocol {
-            WireProtocol::Jtag => {
+            WireProtocol::Jtag | WireProtocol::CJtag => {
                 // try some JTAG stuff
 
                 tracing::debug!("Resetting JTAG chain using trst");
@@ -1095,6 +1184,10 @@ impl DebugProbe for JLink {
         // Set a default speed if not already set
         if self.speed_khz == 0 {
             self.set_speed(400)?;
+        }
+
+        if self.protocol == WireProtocol::CJtag {
+            self.cjtag_activate(false)?;
         }
 
         tracing::debug!("Attached successfully");
@@ -1179,7 +1272,7 @@ impl DebugProbe for JLink {
     ) -> Result<Box<dyn ArmDebugInterface + 'probe>, (Box<dyn DebugProbe>, ArmError)> {
         let settings = SwdProbe::swd_settings(self.as_ref());
         let iface = match self.protocol {
-            WireProtocol::Jtag => {
+            WireProtocol::Jtag | WireProtocol::CJtag => {
                 ArmCommunicationInterface::create_jtag(self, settings, sequence, true)
             }
             WireProtocol::Swd => {
@@ -1191,7 +1284,7 @@ impl DebugProbe for JLink {
 
     fn try_as_swd_probe(self: Box<Self>) -> Result<Box<dyn SwdProbe>, Box<dyn DebugProbe>> {
         match self.protocol {
-            WireProtocol::Jtag => Err(self.into_probe()),
+            WireProtocol::Jtag | WireProtocol::CJtag => Err(self.into_probe()),
             _ => Ok(self),
         }
     }
@@ -1226,7 +1319,7 @@ impl BitbangSwd for JLink {
     where
         S: IntoIterator<Item = IoSequenceItem>,
     {
-        if self.interface != Interface::Jtag {
+        if !matches!(self.interface, Interface::Jtag | Interface::CJtag) {
             return self.perform_swdio_transfer(swdio);
         }
 
@@ -1300,13 +1393,7 @@ impl BitbangJtag for JLink {
         cap: impl IntoIterator<Item = bool>,
     ) -> Result<(), DebugProbeError> {
         for ((tms, tdi), cap) in tms.into_iter().zip(tdi).zip(cap) {
-            self.jtag_tms_bits.push(tms);
-            self.jtag_tdi_bits.push(tdi);
-            self.jtag_capture_tdo.push(cap);
-
-            if self.jtag_tms_bits.len() >= self.jtag_chunk_size {
-                self.flush_jtag()?;
-            }
+            self.shift_jtag_bit(tms, tdi, cap)?;
         }
 
         Ok(())
@@ -1399,6 +1486,7 @@ impl TryFrom<Interface> for WireProtocol {
         match interface {
             Interface::Jtag => Ok(WireProtocol::Jtag),
             Interface::Swd => Ok(WireProtocol::Swd),
+            Interface::CJtag => Ok(WireProtocol::CJtag),
             unknown_interface => Err(JlinkError::UnknownInterface(unknown_interface)),
         }
     }

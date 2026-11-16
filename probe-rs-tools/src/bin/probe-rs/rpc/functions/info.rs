@@ -80,20 +80,31 @@ pub async fn target_metadata(
 }
 
 /// Deduplicated absolute flash sectors for GDB memory-map XML.
+///
+/// Sectors are clipped to the target's NVM regions: a flash algorithm's address range may cover
+/// more than the flash the target has, and GDB ignores a memory map with overlapping regions.
 fn wire_flash_sectors(target: &probe_rs::Target) -> Vec<WireFlashSector> {
+    use probe_rs::config::MemoryRegion;
     use std::collections::BTreeMap;
     use std::collections::btree_map::Entry;
 
     let mut regions = BTreeMap::new();
     for algo in target.flash_algorithms.iter() {
         let start = algo.flash_properties.address_range.start;
-        let end = if let Some(region) =
-            target.memory_region_by_address(algo.flash_properties.address_range.start)
-        {
-            region.address_range().end
-        } else {
-            algo.flash_properties.address_range.end
-        };
+        let end = algo.flash_properties.address_range.end;
+
+        let windows = target
+            .memory_map
+            .iter()
+            .filter_map(|region| match region {
+                MemoryRegion::Nvm(nvm) => {
+                    let window = nvm.range.start.max(start)..nvm.range.end.min(end);
+                    (window.start < window.end).then_some(window)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
         let mut sectors = algo.flash_properties.sectors.clone();
         sectors.sort_by_key(|s| s.address);
         sectors.push(probe_rs::config::SectorDescription {
@@ -101,18 +112,25 @@ fn wire_flash_sectors(target: &probe_rs::Target) -> Vec<WireFlashSector> {
             address: end - start,
         });
         for (current, next) in sectors.iter().zip(sectors.iter().skip(1)) {
-            let sector = WireFlashSector {
-                start: start + current.address,
-                length: next.address - current.address,
-                blocksize: current.size,
-            };
-            match regions.entry(sector.start) {
-                Entry::Vacant(e) => {
-                    e.insert(sector);
+            for window in &windows {
+                let sector_start = (start + current.address).max(window.start);
+                let sector_end = (start + next.address).min(window.end);
+                if sector_start >= sector_end {
+                    continue;
                 }
-                Entry::Occupied(mut e) => {
-                    if sector.blocksize < e.get().blocksize {
+                let sector = WireFlashSector {
+                    start: sector_start,
+                    length: sector_end - sector_start,
+                    blocksize: current.size,
+                };
+                match regions.entry(sector.start) {
+                    Entry::Vacant(e) => {
                         e.insert(sector);
+                    }
+                    Entry::Occupied(mut e) => {
+                        if sector.blocksize < e.get().blocksize {
+                            e.insert(sector);
+                        }
                     }
                 }
             }
@@ -185,7 +203,7 @@ async fn try_show_info(
         probe.attach_to_unspecified()?;
     }
 
-    if protocol == WireProtocol::Jtag
+    if matches!(protocol, WireProtocol::Jtag | WireProtocol::CJtag)
         && let Some(taps) = read_jtag_scan_chain(&mut probe)
     {
         return show_jtag_scan_chain_info(ctx, probe, taps).await;
@@ -367,6 +385,7 @@ async fn show_jtag_scan_chain_info(
         }
 
         match TapKind::classify(tap) {
+            TapKind::Arm if !may_be_jtag_dp(&mut probe, index) => show_unsupported_tap(ctx).await?,
             TapKind::Arm => probe = show_arm_tap_info(ctx, probe).await?,
             TapKind::Riscv => {
                 if !show_riscv_tap_info(ctx, &mut probe).await? {
@@ -384,6 +403,22 @@ async fn show_jtag_scan_chain_info(
     }
 
     Ok(())
+}
+
+/// Return false only when a check shows that the TAP at `index` is not a JTAG-DP.
+///
+/// A boundary-scan TAP can have the same IR length as a JTAG-DP.
+fn may_be_jtag_dp(probe: &mut Probe, index: usize) -> bool {
+    let Some(mut chain) = probe.try_as_jtag_chain() else {
+        return true;
+    };
+    match chain.is_jtag_dp(index) {
+        Ok(is_jtag_dp) => is_jtag_dp,
+        Err(error) => {
+            tracing::debug!("Unable to check whether TAP {index} is a JTAG-DP: {error}");
+            true
+        }
+    }
 }
 
 async fn show_unsupported_tap(ctx: &mut RpcContext) -> anyhow::Result<()> {
@@ -699,7 +734,10 @@ async fn show_arm_info(
         Err(e) => return Err(e.into()),
     };
 
-    let dpinfo = if dp_info.version == dp::DebugPortVersion::DPv2 {
+    let dpinfo = if matches!(
+        dp_info.version,
+        dp::DebugPortVersion::DPv2 | dp::DebugPortVersion::DPv3
+    ) {
         let targetid = interface.read_raw_dp_register(dp, TARGETID::ADDRESS)?;
 
         // Read Instance ID
@@ -1117,6 +1155,7 @@ pub(crate) mod convert {
                 protocol: match request.protocol {
                     WireProtocol::Jtag => Some(ProbeRsWireProtocol::Jtag),
                     WireProtocol::Swd => Some(ProbeRsWireProtocol::Swd),
+                    WireProtocol::CJtag => Some(ProbeRsWireProtocol::CJtag),
                 },
                 non_interactive: true,
                 probe: Some(from_wire_debug_probe_selector(request.probe.selector())),
@@ -1177,7 +1216,8 @@ pub(crate) mod convert {
 
 #[cfg(test)]
 mod tests {
-    use super::{JEP_ST, JEP_TENSILICA, JtagTapInfo, TapKind};
+    use super::{JEP_ST, JEP_TENSILICA, JtagTapInfo, TapKind, wire_flash_sectors};
+    use probe_rs::config::Registry;
 
     fn kind(ir_len: u8, idcode: Option<u32>) -> TapKind {
         TapKind::classify(&JtagTapInfo { idcode, ir_len })
@@ -1204,5 +1244,33 @@ mod tests {
         // Xilinx Zynq-7000 PL
         assert_eq!(kind(6, Some(0x0372_7093)), TapKind::Unsupported);
         assert_eq!(kind(8, None), TapKind::Unsupported);
+    }
+
+    fn flash_sectors(target: &str) -> Vec<(u64, u64, u64)> {
+        let registry = Registry::from_builtin_families();
+        let target = registry.get_target_by_name(target).unwrap();
+        wire_flash_sectors(&target)
+            .iter()
+            .map(|s| (s.start, s.length, s.blocksize))
+            .collect()
+    }
+
+    #[test]
+    fn flash_sectors_follow_nvm() {
+        assert_eq!(
+            flash_sectors("nRF52840_xxAA"),
+            [
+                (0x0000_0000, 0x0010_0000, 0x1000),
+                (0x1000_1000, 0x0000_1000, 0x1000)
+            ]
+        );
+    }
+
+    #[test]
+    fn flash_sectors_clipped_to_nvm() {
+        assert_eq!(
+            flash_sectors("SF32LB52"),
+            [(0x1200_0000, 0x0E00_0000, 0x1_0000)]
+        );
     }
 }

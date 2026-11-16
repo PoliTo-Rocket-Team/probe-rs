@@ -6,16 +6,20 @@ use probe_rs_target::CoreType;
 
 use crate::architecture::arm::{
     ArmDebugInterface, ArmError, FullyQualifiedApAddress,
+    ap::{ApClass, ApRegister, IDR},
     component::{TraceFunnel, TraceSink},
     memory::{ArmMemoryInterface, CoresightComponent, PeripheralType, romtable::RomTableError},
-    sequences::ArmDebugSequence,
+    sequences::{ArmDebugSequence, DefaultArmSequence},
 };
 
 /// Supported lines for custom sequences on STM32H7xx devices.
 #[derive(Debug)]
 pub enum Stm32h7Line {
-    /// STM32H72x, STM32H73x, STM32H74x, STM32H75x, STM32H7Ax, STM32H7Bx
+    /// STM32H72x, STM32H73x, STM32H7Ax, STM32H7Bx
     H7,
+
+    /// STM32H74x, STM32H75x
+    H74,
 
     /// STM32H7Rx, STM32H7Sx
     H7S,
@@ -45,6 +49,7 @@ enum TraceFunnelId {
 #[derive(Debug)]
 pub struct Stm32h7 {
     ap: u8,
+    swtf: bool,
 }
 
 impl Stm32h7 {
@@ -52,11 +57,12 @@ impl Stm32h7 {
     pub fn create(family: Stm32h7Line) -> Arc<Self> {
         let ap = match family {
             // Most H7 variants have the debug unit on AP2.
-            Stm32h7Line::H7 => 2,
+            Stm32h7Line::H7 | Stm32h7Line::H74 => 2,
             // The H7S/R lack power domain 3 and the third AP; their debug unit is on AP1.
             Stm32h7Line::H7S => 1,
         };
-        Arc::new(Self { ap })
+        let swtf = matches!(family, Stm32h7Line::H74);
+        Arc::new(Self { ap, swtf })
     }
 
     /// Configure all debug components on the chip.
@@ -169,7 +175,47 @@ fn find_trace_funnel(
         })
 }
 
+/// Whether `core_ap` is a memory AP. The AP of the CM4 of the dual-core parts is missing while the
+/// CM4 is not booted, for example with the BCM4 option bit cleared.
+fn core_ap_present(
+    interface: &mut dyn ArmDebugInterface,
+    core_ap: &FullyQualifiedApAddress,
+) -> bool {
+    let idr = interface.read_raw_ap_register(core_ap, IDR::ADDRESS);
+    matches!(idr.map(IDR::try_from), Ok(Ok(idr)) if idr.CLASS() == ApClass::MemAp)
+}
+
 impl ArmDebugSequence for Stm32h7 {
+    fn on_attach(
+        &self,
+        interface: &mut dyn ArmDebugInterface,
+        core_ap: &FullyQualifiedApAddress,
+        core_type: CoreType,
+        target: &mut crate::Target,
+    ) -> Result<(), ArmError> {
+        if !core_ap_present(interface, core_ap) {
+            return Err(ArmError::CoreDisabled);
+        }
+
+        DefaultArmSequence(()).on_attach(interface, core_ap, core_type, target)
+    }
+
+    fn debug_core_start(
+        &self,
+        interface: &mut dyn ArmDebugInterface,
+        core_ap: &FullyQualifiedApAddress,
+        core_type: CoreType,
+        debug_base: Option<u64>,
+        cti_base: Option<u64>,
+    ) -> Result<(), ArmError> {
+        if !core_ap_present(interface, core_ap) {
+            tracing::debug!("STM32H7: no AP at {core_ap:?}, the core is not booted");
+            return Ok(());
+        }
+
+        DefaultArmSequence(()).debug_core_start(interface, core_ap, core_type, debug_base, cti_base)
+    }
+
     fn debug_device_unlock(
         &self,
         interface: &mut dyn ArmDebugInterface,
@@ -188,8 +234,11 @@ impl ArmDebugSequence for Stm32h7 {
     fn debug_core_stop(
         &self,
         memory: &mut dyn ArmMemoryInterface,
-        _core_type: CoreType,
+        core_type: CoreType,
     ) -> Result<(), ArmError> {
+        // The stock steps first: halting debug off and the vector catches cleared.
+        self.debug_core_stop_default(memory, core_type)?;
+
         // Power down the debug components through selected AP.
 
         self.enable_debug_components(&mut *memory, false)?;
@@ -217,18 +266,20 @@ impl ArmDebugSequence for Stm32h7 {
             TraceSink::Tpiu(_) | TraceSink::TraceMemory => cstf.enable_port(0b10)?,
         }
 
-        // The SWTF needs to be configured to route traffic to SWO. When not in use, it needs to be
-        // disabled so that the SWO peripheral does not propagate buffer overflows through the
-        // trace bus via busy signalling.
-        let mut swtf = TraceFunnel::new(
-            interface,
-            find_trace_funnel(components, TraceFunnelId::SerialWire)?,
-        );
-        swtf.unlock()?;
-        if matches!(sink, TraceSink::Swo(_)) {
-            swtf.enable_port(0b01)?;
-        } else {
-            swtf.enable_port(0b00)?;
+        if self.swtf {
+            // The SWTF needs to be configured to route traffic to SWO. When not in use, it needs to be
+            // disabled so that the SWO peripheral does not propagate buffer overflows through the
+            // trace bus via busy signalling.
+            let mut swtf = TraceFunnel::new(
+                interface,
+                find_trace_funnel(components, TraceFunnelId::SerialWire)?,
+            );
+            swtf.unlock()?;
+            if matches!(sink, TraceSink::Swo(_)) {
+                swtf.enable_port(0b01)?;
+            } else {
+                swtf.enable_port(0b00)?;
+            }
         }
 
         Ok(())

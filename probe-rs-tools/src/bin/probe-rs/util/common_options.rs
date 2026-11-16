@@ -13,7 +13,7 @@ use probe_rs::{
     probe::{
         DebugProbeError, DebugProbeInfo, DebugProbeSelector, Probe, ProbeCreationError,
         WireProtocol,
-        list::{Accessibility, Lister},
+        list::{Accessibility, Lister, default_probe_index},
     },
 };
 use serde::{Deserialize, Serialize};
@@ -64,7 +64,8 @@ pub struct BinaryDownloadOptions {
         help_heading = "DOWNLOAD CONFIGURATION"
     )]
     pub flash_layout_output_path: Option<String>,
-    /// Before flashing, read back all the flashed data to skip flashing if the device is up to date.
+    /// Before flashing, compare each erase sector with the image, and skip the sectors that are up
+    /// to date.
     #[arg(long, help_heading = "DOWNLOAD CONFIGURATION")]
     pub preverify: bool,
     /// After flashing, read back all the flashed data to verify it has been written correctly.
@@ -135,7 +136,7 @@ pub struct ProbeOptions {
     )]
     pub chip_description_path: Option<PathBuf>,
 
-    /// Protocol used to connect to chip. Possible options: [swd, jtag]
+    /// Protocol used to connect to chip. Possible options: [swd, jtag, cjtag]
     #[arg(long, env = "PROBE_RS_PROTOCOL", help_heading = "PROBE CONFIGURATION")]
     pub protocol: Option<WireProtocol>,
 
@@ -311,15 +312,16 @@ impl<'r> LoadedProbeOptions<'r> {
     }
 
     /// Selects a probe from a list of probes.
-    /// If there is only one probe, it will be selected automatically.
-    /// If there are multiple probes, the user will be prompted to select one unless
-    /// started in non-interactive mode.
+    /// If there is only one probe, or all listed probes are one device, it will be selected
+    /// automatically. Otherwise, the user will be prompted to select one unless started in
+    /// non-interactive mode.
     fn select_probe(lister: &Lister, non_interactive: bool) -> Result<Probe, OperationError> {
         let list = lister.list_all();
-        let selected = match list.len() {
-            0 | 1 => list.first().ok_or(OperationError::NoProbesFound),
-            _ if non_interactive => Err(OperationError::MultipleProbesFound { list }),
-            _ => Self::interactive_probe_select(&list),
+        let selected = match default_probe_index(&list) {
+            Some(index) => Ok(&list[index]),
+            None if list.is_empty() => Err(OperationError::NoProbesFound),
+            None if non_interactive => Err(OperationError::MultipleProbesFound { list }),
+            None => Self::interactive_probe_select(&list),
         };
 
         selected.and_then(|probe_info| Ok(lister.open(probe_info)?))
@@ -691,78 +693,9 @@ impl From<std::io::Error> for OperationError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::util::busy_lister::BusyLister;
     use probe_rs::integration::FakeProbe;
-    use probe_rs::probe::{DebugProbe, DebugProbeInfo, ProbeCreationError, ProbeFactory};
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    /// A probe that another process holds: `open` fails until `free_after`
-    /// attempts have been made.
-    struct BusyLister {
-        info: DebugProbeInfo,
-        attempts: AtomicUsize,
-        free_after: usize,
-        /// The probe answers the open, then faults.
-        faulty: bool,
-    }
-
-    #[derive(Debug)]
-    struct MockProbeFactory;
-
-    impl std::fmt::Display for MockProbeFactory {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str("Mocked Probe")
-        }
-    }
-
-    impl ProbeFactory for MockProbeFactory {
-        fn open(
-            &self,
-            _selector: &DebugProbeSelector,
-        ) -> Result<Box<dyn DebugProbe>, DebugProbeError> {
-            unreachable!("BusyLister opens FakeProbe directly")
-        }
-
-        fn list_probes(&self) -> Vec<probe_rs::probe::list::ProbeListItem> {
-            Vec::new()
-        }
-    }
-
-    impl std::fmt::Debug for BusyLister {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str("BusyLister")
-        }
-    }
-
-    impl probe_rs::integration::ProbeLister for BusyLister {
-        fn open(&self, _selector: &DebugProbeSelector) -> Result<Probe, DebugProbeError> {
-            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
-            if self.faulty {
-                return Err(DebugProbeError::ProbeCouldNotBeCreated(
-                    ProbeCreationError::Usb(std::io::Error::other(
-                        "hardware fault or protocol violation",
-                    )),
-                ));
-            }
-            if attempt < self.free_after {
-                return Err(DebugProbeError::ProbeCouldNotBeCreated(
-                    ProbeCreationError::CouldNotOpen,
-                ));
-            }
-            Ok(Probe::from_specific_probe(Box::new(
-                FakeProbe::with_mocked_core(),
-            )))
-        }
-
-        fn list_with_access(
-            &self,
-            _selector: Option<&DebugProbeSelector>,
-        ) -> Vec<probe_rs::probe::list::ProbeListItem> {
-            vec![probe_rs::probe::list::ProbeListItem::accessible(
-                self.info.clone(),
-            )]
-        }
-    }
 
     fn busy_lister(free_after: usize) -> (Arc<BusyLister>, Lister) {
         make_lister(free_after, false)
@@ -773,20 +706,8 @@ mod tests {
     }
 
     fn make_lister(free_after: usize, faulty: bool) -> (Arc<BusyLister>, Lister) {
-        let lister = Arc::new(BusyLister {
-            info: DebugProbeInfo::new(
-                "Mock probe",
-                0x12,
-                0x23,
-                Some("busy_serial".to_owned()),
-                &MockProbeFactory,
-                None,
-                false,
-            ),
-            attempts: AtomicUsize::new(0),
-            free_after,
-            faulty,
-        });
+        let lister = BusyLister::new(free_after, FakeProbe::with_mocked_core());
+        let lister = Arc::new(if faulty { lister.faulty() } else { lister });
 
         struct ArcLister(Arc<BusyLister>);
 
@@ -839,7 +760,7 @@ mod tests {
             .unwrap();
 
         assert!(options.attach_probe(&handle).is_ok());
-        assert_eq!(lister.attempts.load(Ordering::SeqCst), 3);
+        assert_eq!(lister.attempts(), 3);
     }
 
     /// The wait cannot repair a probe that faults, so the attach timeout must
@@ -853,7 +774,7 @@ mod tests {
             .unwrap();
 
         assert!(options.attach_probe(&handle).is_err());
-        assert_eq!(lister.attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(lister.attempts(), 1);
     }
 
     #[test]
@@ -863,7 +784,7 @@ mod tests {
         let options = probe_options(None).load(&mut registry).unwrap();
 
         assert!(options.attach_probe(&handle).is_err());
-        assert_eq!(lister.attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(lister.attempts(), 1);
     }
 
     #[test]

@@ -6,10 +6,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use super::saci;
-use super::saci::{
-    BOOT_STATUS_APP_WAITLOOP_DBGPROBE, BOOT_STATUS_BLDR_WAITLOOP_DBGPROBE,
-    BOOT_STATUS_BOOT_WAITLOOP_DBGPROBE, SaciResult,
-};
+use super::saci::{DeviceStatusRegister, SaciResult};
 use crate::MemoryMappedRegister;
 use crate::Session;
 use crate::architecture::arm::ArmDebugInterface;
@@ -18,11 +15,17 @@ use crate::architecture::arm::armv6m::{BpCtrl, Demcr, Dhcsr};
 use crate::architecture::arm::core::cortex_m;
 use crate::architecture::arm::dp::DpAddress;
 use crate::architecture::arm::memory::ArmMemoryInterface;
-use crate::architecture::arm::sequences::{ArmDebugSequence, cortex_m_core_start};
+use crate::architecture::arm::sequences::{
+    ArmDebugSequence, ArmDebugSequenceError, cortex_m_core_start,
+};
 use crate::architecture::arm::traits::DebugPortWire;
 use crate::architecture::arm::{ArmError, FullyQualifiedApAddress};
-use crate::flashing::DebugFlashSequence;
-use crate::probe::DebugProbeError;
+use crate::config::NvmRegion;
+use crate::flashing::{
+    CompareContext, CompareCost, CompareOutcome, DebugFlashSequence, FlashCompare, FlashError,
+    SectorCheck,
+};
+use crate::probe::{DebugProbeError, WireProtocol};
 use probe_rs_target::CoreType;
 
 /// Marker struct for debug and flash sequencing on CC23xx/CC27xx family parts.
@@ -38,6 +41,11 @@ pub struct CC23xxCC27xx {
     /// stays active for flash operations. Shared with CC23xxCC27xxFlashSequence
     /// via Arc and reset to false when the flash sequence is dropped.
     saci_flash_mode: Arc<AtomicBool>,
+    /// AHB-AP state as of the last debug_port_start.
+    ahb_ap_available: AtomicBool,
+    /// Set by reset_system when no halt was requested, so debug_port_start
+    /// boots the application instead of halting in the ROM.
+    run_after_reset: AtomicBool,
 }
 
 /// Flash memory region types for CC23xx/CC27xx devices.
@@ -58,11 +66,51 @@ impl CC23xxCC27xx {
             _name: name,
             boot_loop: AtomicBool::new(false),
             saci_flash_mode: Arc::new(AtomicBool::new(false)),
+            ahb_ap_available: AtomicBool::new(false),
+            run_after_reset: AtomicBool::new(false),
         })
     }
 
     fn is_in_boot_loop(&self) -> bool {
         self.boot_loop.load(Ordering::SeqCst)
+    }
+
+    /// Leave SACI and wait for the ROM to act on the exit command.
+    ///
+    /// Which command is sent depends on `run_after_reset`, set by reset_system:
+    ///
+    /// - Run requested (reset without halt): send BLDR_APP_EXIT_SACI_RUN. The
+    ///   ROM boots the application, which is done once the AHB-AP is available.
+    /// - Halt requested, or a plain connect: send DEBUG_EXIT_SACI_HALT. The ROM
+    ///   stops in its wait loop before running the application, which is done
+    ///   once the boot status reports that wait loop. debug_core_start then
+    ///   halts the core and releases it.
+    ///
+    /// Returns the final device status. If the wanted state is not reached in
+    /// time the last status is returned instead of an error, so the caller can
+    /// inspect it and decide what to report.
+    fn exit_saci(&self, interface: &mut dyn DapAccess) -> Result<DeviceStatusRegister, ArmError> {
+        // In practice, this should take less time and bails early, timeout only prevents forever loop
+        const EXIT_SACI_TIMEOUT: Duration = Duration::from_secs(2);
+
+        let status = if self.run_after_reset.load(Ordering::SeqCst) {
+            saci::send_command(interface, saci::cmd::BLDR_APP_EXIT_SACI_RUN)?;
+            saci::wait_for_device_status(
+                interface,
+                EXIT_SACI_TIMEOUT,
+                DeviceStatusRegister::ahb_ap_available,
+            )
+        } else {
+            saci::send_command(interface, saci::cmd::DEBUG_EXIT_SACI_HALT)?;
+            saci::wait_for_device_status(
+                interface,
+                EXIT_SACI_TIMEOUT,
+                DeviceStatusRegister::in_wait_loop,
+            )
+        };
+
+        // A timeout is not fatal here: the caller checks the status it gets back.
+        status.or_else(|_| saci::read_device_status(interface))
     }
 }
 
@@ -83,7 +131,11 @@ impl ArmDebugSequence for CC23xxCC27xx {
         // Reset from the SEC-AP as CCS does. The ROM then waits in SACI.
         // Unlike an AIRCR write, nothing else is sent while the device resets.
         saci::reset_device(interface);
-        interface.reinitialize()?;
+        self.run_after_reset
+            .store(!demcr.vc_corereset(), Ordering::SeqCst);
+        let reconnected = interface.reinitialize();
+        self.run_after_reset.store(false, Ordering::SeqCst);
+        reconnected?;
         self.debug_core_start(interface, &ap, core_type, debug_base, None)?;
 
         if demcr.vc_corereset() {
@@ -110,7 +162,12 @@ impl ArmDebugSequence for CC23xxCC27xx {
 
         // CC23xx/CC27xx-specific: check device state via CFG-AP and exit SACI
         // if the device is in SACI mode and we are not in a flash operation.
-        let mut device_status = saci::read_device_status(interface)?;
+        // Right after a reset the ROM may not have reached SACI yet.
+        let mut device_status = saci::wait_for_device_status(
+            interface,
+            Duration::from_millis(100),
+            DeviceStatusRegister::has_reached_saci,
+        )?;
 
         if !device_status.ahb_ap_available() {
             if self.saci_flash_mode.load(Ordering::SeqCst) {
@@ -119,31 +176,26 @@ impl ArmDebugSequence for CC23xxCC27xx {
                 tracing::info!(
                     "CC23xx/CC27xx: debug_port_start in flash mode, leaving SACI active"
                 );
+                self.boot_loop.store(false, Ordering::SeqCst);
+                self.ahb_ap_available.store(false, Ordering::SeqCst);
                 return Ok(());
             }
 
             // Normal debug session: exit SACI so the AHB-AP becomes accessible.
-            saci::send_command(interface, saci::cmd::DEBUG_EXIT_SACI_HALT)?;
-
-            thread::sleep(Duration::from_millis(30));
-            device_status = saci::read_device_status(interface)?;
-
-            match device_status.boot_status() {
-                BOOT_STATUS_BOOT_WAITLOOP_DBGPROBE
-                | BOOT_STATUS_BLDR_WAITLOOP_DBGPROBE
-                | BOOT_STATUS_APP_WAITLOOP_DBGPROBE => {
-                    tracing::info!("BOOT_WAITLOOP_DBGPROBE");
-                    self.boot_loop.store(true, Ordering::SeqCst);
-                }
-                _ => {
-                    if !device_status.ahb_ap_available() {
-                        tracing::warn!(
-                            "CC23xx/CC27xx: Device is still in SACI mode after EXIT_SACI_HALT"
-                        );
-                    }
-                }
+            device_status = self.exit_saci(interface)?;
+            if !device_status.ahb_ap_available() {
+                tracing::warn!(
+                    "CC23xx/CC27xx: Device stayed in SACI mode (no valid image or debug locked), only flashing is available"
+                );
             }
         }
+
+        // Set on every connect, so a stale flag never makes debug_core_start
+        // halt a core that was booted.
+        self.boot_loop
+            .store(device_status.in_wait_loop(), Ordering::SeqCst);
+        self.ahb_ap_available
+            .store(device_status.ahb_ap_available(), Ordering::SeqCst);
 
         Ok(())
     }
@@ -156,6 +208,12 @@ impl ArmDebugSequence for CC23xxCC27xx {
         _debug_base: Option<u64>,
         _cti_base: Option<u64>,
     ) -> Result<(), ArmError> {
+        // A blank device cannot leave SACI, so there is no AHB-AP yet.
+        // Skip core setup so it can still be flashed over SACI.
+        if !self.ahb_ap_available.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+
         if self.is_in_boot_loop() {
             // Step 1: halt the CPU.
             let mut dhcsr = Dhcsr(0);
@@ -184,10 +242,28 @@ impl ArmDebugSequence for CC23xxCC27xx {
         cortex_m_core_start(&mut *core)
     }
 
+    fn on_attach(
+        &self,
+        _interface: &mut dyn ArmDebugInterface,
+        _ap: &FullyQualifiedApAddress,
+        _core_type: CoreType,
+        _target: &mut crate::Target,
+    ) -> Result<(), ArmError> {
+        // Report the core as disabled until the device has left SACI.
+        if !self.ahb_ap_available.load(Ordering::SeqCst) {
+            return Err(ArmError::CoreDisabled);
+        }
+        Ok(())
+    }
+
     fn debug_flash_sequence(&self) -> Option<Arc<dyn DebugFlashSequence>> {
         Some(Arc::new(CC23xxCC27xxFlashSequence::new_with_flag(
             Arc::clone(&self.saci_flash_mode),
         )))
+    }
+
+    fn flash_compare(&self) -> Option<Arc<dyn FlashCompare>> {
+        Some(Arc::new(SaciCompare))
     }
 
     /// Connect without a reset, so a running application keeps running.
@@ -199,6 +275,14 @@ impl ArmDebugSequence for CC23xxCC27xx {
         interface: &mut dyn DebugPortWire,
         dp: DpAddress,
     ) -> Result<(), ArmError> {
+        // Refuse anything besides SWD
+        if interface.active_protocol() != Some(WireProtocol::Swd) {
+            return Err(ArmDebugSequenceError::SequenceSpecific(
+                "The CC23xx/CC27xx family supports SWD only".into(),
+            )
+            .into());
+        }
+
         let Err(error) = self.debug_port_setup_default(interface, dp) else {
             return Ok(());
         };
@@ -230,6 +314,13 @@ impl ArmDebugSequence for CC23xxCC27xx {
 const CCFG_START: u64 = 0x4E02_0000;
 /// Address boundary for the SCFG region on CC23xx/CC27xx devices.
 const SCFG_START: u64 = 0x4E04_0000;
+
+/// FLASH_ERASE_CHIP, FLASH_ERASE_MAIN_APP: keep the sectors that the CCFG retains.
+const RETAIN_SECTORS: u32 = 1 << 0;
+/// FLASH_VERIFY_CCFG_SECTOR: skip the CRC check of the user record.
+const SKIP_USER_RECORD: u32 = 1 << 1;
+/// FLASH_VERIFY_CCFG_SECTOR: check that the sector is blank.
+const BLANK_CHECK: u32 = 1 << 15;
 
 /// Host-side flash programming implementation for CC23xx/CC27xx devices.
 ///
@@ -295,6 +386,52 @@ impl CC23xxCC27xxFlashSequence {
         }
     }
 
+    /// Sends a SACI erase command and returns its result.
+    fn erase_command(
+        interface: &mut dyn DapAccess,
+        command: u32,
+        parameters: u32,
+    ) -> Result<SaciResult, ArmError> {
+        let words = [saci::make_header(command, parameters), saci::cmd::FLASH_KEY];
+        saci::send_words(interface, &words, Duration::from_millis(200))?;
+
+        let response = saci::read_response(interface, Duration::from_secs(30))?;
+        // The retained sector masks follow.
+        for _ in 0..response >> 24 {
+            let mask = saci::read_response(interface, Duration::from_millis(100))?;
+            tracing::debug!("CC23xx/CC27xx: retained sectors {mask:#010x}");
+        }
+        Ok(SaciResult::from(((response >> 16) & 0xFF) as u8))
+    }
+
+    /// Whether the CCFG passes a FLASH_VERIFY_CCFG_SECTOR check with `parameters`.
+    fn verify_ccfg(interface: &mut dyn DapAccess, parameters: u32) -> Result<bool, ArmError> {
+        let header = saci::make_header(saci::cmd::FLASH_VERIFY_CCFG_SECTOR, parameters);
+        saci::send_words(interface, &[header, 0, 0, 0, 0], Duration::from_millis(200))?;
+        let response = saci::read_response(interface, Duration::from_secs(5))?;
+        Ok(SaciResult::from(((response >> 16) & 0xFF) as u8) == SaciResult::Success)
+    }
+
+    /// Whether the CCFG sector is blank.
+    fn ccfg_is_blank(interface: &mut dyn DapAccess) -> Result<bool, ArmError> {
+        Self::verify_ccfg(interface, BLANK_CHECK)
+    }
+
+    /// Whether the CCFG is valid: its embedded CRCs match, apart from the user record's.
+    fn ccfg_is_valid(interface: &mut dyn DapAccess) -> Result<bool, ArmError> {
+        Self::verify_ccfg(interface, SKIP_USER_RECORD)
+    }
+
+    fn check_erase(result: SaciResult) -> Result<(), crate::Error> {
+        if result != SaciResult::Success {
+            return Err(crate::Error::Other(format!(
+                "SACI erase failed: {result:?}"
+            )));
+        }
+        tracing::info!("CC23xx/CC27xx: Erase completed");
+        Ok(())
+    }
+
     fn program_main(
         &self,
         interface: &mut dyn DapAccess,
@@ -319,10 +456,11 @@ impl CC23xxCC27xxFlashSequence {
 
     /// Program the CCFG sector using FLASH_PROG_CCFG_SECTOR
     ///
-    /// Pads data to exactly 512 words (2048 bytes) with 0xFF. Sets skip_user_rec=1.
+    /// Pads data to exactly 512 words (2048 bytes) with 0xFF. The user record is written too:
+    /// after the chip erase, it holds only what the image has there.
     fn program_ccfg(&self, interface: &mut dyn DapAccess, data: &[u8]) -> Result<(), ArmError> {
         // skip_user_rec = bit 0 of cmd_specific
-        let header = saci::make_header(saci::cmd::FLASH_PROG_CCFG_SECTOR, 0x0001);
+        let header = saci::make_header(saci::cmd::FLASH_PROG_CCFG_SECTOR, 0);
 
         // Pad to exactly 2048 bytes.
         let mut padded = vec![0xFFu8; 2048];
@@ -375,6 +513,117 @@ impl Default for CC23xxCC27xxFlashSequence {
     }
 }
 
+/// Compares flash with the CRC checks of the SACI ROM.
+///
+/// For CCFG and SCFG, a match does not prove that the flash holds the image: the ROM checks the
+/// CRCs in CCFG, and only 0xE4 bytes of SCFG. A standalone verify can pass on a different, valid
+/// configuration. A download is not affected: these devices have no sector erase, so a compare
+/// never skips programming. A read-back is not possible: SACI mode has no AHB-AP.
+#[derive(Debug)]
+pub struct SaciCompare;
+
+impl FlashCompare for SaciCompare {
+    fn name(&self) -> &str {
+        "SACI"
+    }
+
+    fn cost(&self) -> CompareCost {
+        CompareCost::Cheap
+    }
+
+    fn compare(
+        &self,
+        context: &mut CompareContext<'_>,
+        _region: &NvmRegion,
+        checks: &mut [SectorCheck<'_>],
+    ) -> Result<(), FlashError> {
+        let interface = context
+            .session()?
+            .get_arm_interface()
+            .map_err(|error| FlashError::Core(error.into()))?;
+        for check in checks {
+            let mut outcome = CompareOutcome::Match;
+            for (address, data) in check.contiguous_ranges() {
+                if !saci_verify(interface, address, &data).map_err(FlashError::Core)? {
+                    outcome = CompareOutcome::Mismatch;
+                    break;
+                }
+            }
+            check.set_outcome(outcome);
+        }
+
+        Ok(())
+    }
+}
+
+/// Checks `data` at `address` with a SACI verify command.
+fn saci_verify(
+    interface: &mut dyn ArmDebugInterface,
+    address: u64,
+    data: &[u8],
+) -> Result<bool, crate::Error> {
+    tracing::debug!(
+        "CC23xx/CC27xx: Verifying {} bytes at 0x{:08X}",
+        data.len(),
+        address
+    );
+
+    if address >= SCFG_START {
+        // FLASH_VERIFY_SCFG_SECTOR (0x1B): [header(check_exp_crc=1), expCrc32]
+        //
+        // The ROM verifies CRC over only the first 0xE4 (228) bytes of SCFG,
+        // matching the range covered by Scfg::update_crcs and OpenOCD's
+        // SCFG_CONTENT_SIZE constant. The trailing key-ring slots are excluded.
+        const SCFG_CRC_BYTE_COUNT: usize = 0xE4;
+        let crc_data = &data[..data.len().min(SCFG_CRC_BYTE_COUNT)];
+        let expected_crc = saci::crc32_iso_hdlc(crc_data);
+        let header = saci::make_header(saci::cmd::FLASH_VERIFY_SCFG_SECTOR, 0x0001);
+        let words = [header, expected_crc];
+        saci::send_words(interface, &words, Duration::from_millis(100))?;
+        let response = saci::read_response(interface, Duration::from_secs(10))?;
+        let result = SaciResult::from(((response >> 16) & 0xFF) as u8);
+        match result {
+            SaciResult::Success => Ok(true),
+            SaciResult::Crc32Mismatch => Ok(false),
+            _ => Err(
+                ArmError::Other(format!("SACI FLASH_VERIFY_SCFG_SECTOR failed: {result:?}")).into(),
+            ),
+        }
+    } else if address >= CCFG_START {
+        // FLASH_VERIFY_CCFG_SECTOR (0x11): check_exp_crcs=0, skip_user_rec=1.
+        // Lets the ROM verify its own embedded CRCs rather than requiring the
+        // host to supply external CRC values.
+        let header = saci::make_header(saci::cmd::FLASH_VERIFY_CCFG_SECTOR, 0x0002);
+        let words = [header, 0u32, 0u32, 0u32, 0u32];
+        saci::send_words(interface, &words, Duration::from_millis(100))?;
+        let response = saci::read_response(interface, Duration::from_secs(10))?;
+        let result = SaciResult::from(((response >> 16) & 0xFF) as u8);
+        match result {
+            SaciResult::Success => Ok(true),
+            SaciResult::Crc32Mismatch | SaciResult::BlankCheckFailed => Ok(false),
+            _ => Err(
+                ArmError::Other(format!("SACI FLASH_VERIFY_CCFG_SECTOR failed: {result:?}")).into(),
+            ),
+        }
+    } else {
+        // FLASH_VERIFY_MAIN_SECTORS (0x10): [header, firstSectorAddr, byteCount, expCrc32]
+        let expected_crc = saci::crc32_iso_hdlc(data);
+        let header = saci::make_header(saci::cmd::FLASH_VERIFY_MAIN_SECTORS, 0);
+        let words = [header, address as u32, data.len() as u32, expected_crc];
+        saci::send_words(interface, &words, Duration::from_millis(100))?;
+        let response = saci::read_response(interface, Duration::from_secs(10))?;
+        let result = SaciResult::from(((response >> 16) & 0xFF) as u8);
+        match result {
+            SaciResult::Success => Ok(true),
+            SaciResult::Crc32Mismatch => Ok(false),
+            _ => Err(
+                ArmError::Other(format!("SACI FLASH_VERIFY_MAIN_SECTORS failed: {result:?}"))
+                    .into(),
+            ),
+        }
+    }
+}
+
 impl DebugFlashSequence for CC23xxCC27xxFlashSequence {
     fn prepare_flash(&self, session: &mut Session) -> Result<(), crate::Error> {
         let interface = session.get_arm_interface()?;
@@ -390,21 +639,34 @@ impl DebugFlashSequence for CC23xxCC27xxFlashSequence {
         Ok(())
     }
 
+    /// The sectors that the CCFG retains are kept when possible. On a CC27xx, they hold the HSM
+    /// firmware, which probe-rs can't provision again.
     fn erase_all(&self, session: &mut Session) -> Result<(), crate::Error> {
         let interface = session.get_arm_interface()?;
 
-        tracing::info!("CC23xx/CC27xx: Chip erase via SACI FLASH_ERASE_CHIP (0x09)");
-
-        // FLASH_ERASE_CHIP (0x09): [header, FLASH_KEY]
-        let header = saci::make_header(saci::cmd::FLASH_ERASE_CHIP, 0);
-        let words = [header, saci::cmd::FLASH_KEY];
-        saci::send_words(interface, &words, Duration::from_millis(200))?;
-
-        let response = saci::read_response(interface, Duration::from_secs(30))?;
-        saci::check_result(response, "FLASH_ERASE_CHIP")?;
-
-        tracing::info!("CC23xx/CC27xx: Chip erase completed");
-        Ok(())
+        // Retaining sectors needs a valid CCFG. With an invalid one, the ROM doesn't refuse the
+        // option: it erases the sectors too.
+        let result = if Self::ccfg_is_valid(interface)? {
+            tracing::info!(
+                "CC23xx/CC27xx: erasing the chip, keeping the sectors that the CCFG retains"
+            );
+            Self::erase_command(interface, saci::cmd::FLASH_ERASE_CHIP, RETAIN_SECTORS)?
+        } else if Self::ccfg_is_blank(interface)? {
+            // Erasing the application never erases the HSM firmware. Parts without an HSM don't
+            // have the command.
+            tracing::info!("CC23xx/CC27xx: no CCFG, erasing the application sectors");
+            match Self::erase_command(interface, saci::cmd::FLASH_ERASE_MAIN_APP, 0)? {
+                SaciResult::InvalidCmdId => {
+                    tracing::info!("CC23xx/CC27xx: no FLASH_ERASE_MAIN_APP, erasing the chip");
+                    Self::erase_command(interface, saci::cmd::FLASH_ERASE_CHIP, 0)?
+                }
+                result => result,
+            }
+        } else {
+            tracing::warn!("CC23xx/CC27xx: invalid CCFG, erasing the retained sectors too");
+            Self::erase_command(interface, saci::cmd::FLASH_ERASE_CHIP, 0)?
+        };
+        Self::check_erase(result)
     }
 
     fn program(
@@ -429,78 +691,6 @@ impl DebugFlashSequence for CC23xxCC27xxFlashSequence {
             self.program_main(interface, address, data)?;
         }
         Ok(())
-    }
-
-    fn verify(
-        &self,
-        session: &mut Session,
-        address: u64,
-        data: &[u8],
-    ) -> Result<bool, crate::Error> {
-        tracing::debug!(
-            "CC23xx/CC27xx: Verifying {} bytes at 0x{:08X}",
-            data.len(),
-            address
-        );
-
-        let interface = session.get_arm_interface()?;
-
-        if address >= SCFG_START {
-            // FLASH_VERIFY_SCFG_SECTOR (0x1B): [header(check_exp_crc=1), expCrc32]
-            //
-            // The ROM verifies CRC over only the first 0xE4 (228) bytes of SCFG,
-            // matching the range covered by Scfg::update_crcs and OpenOCD's
-            // SCFG_CONTENT_SIZE constant. The trailing key-ring slots are excluded.
-            const SCFG_CRC_BYTE_COUNT: usize = 0xE4;
-            let crc_data = &data[..data.len().min(SCFG_CRC_BYTE_COUNT)];
-            let expected_crc = saci::crc32_iso_hdlc(crc_data);
-            let header = saci::make_header(saci::cmd::FLASH_VERIFY_SCFG_SECTOR, 0x0001);
-            let words = [header, expected_crc];
-            saci::send_words(interface, &words, Duration::from_millis(100))?;
-            let response = saci::read_response(interface, Duration::from_secs(10))?;
-            let result = SaciResult::from(((response >> 16) & 0xFF) as u8);
-            match result {
-                SaciResult::Success => Ok(true),
-                SaciResult::Crc32Mismatch => Ok(false),
-                _ => Err(ArmError::Other(format!(
-                    "SACI FLASH_VERIFY_SCFG_SECTOR failed: {result:?}"
-                ))
-                .into()),
-            }
-        } else if address >= CCFG_START {
-            // FLASH_VERIFY_CCFG_SECTOR (0x11): check_exp_crcs=0, skip_user_rec=1.
-            // Lets the ROM verify its own embedded CRCs rather than requiring the
-            // host to supply external CRC values.
-            let header = saci::make_header(saci::cmd::FLASH_VERIFY_CCFG_SECTOR, 0x0002);
-            let words = [header, 0u32, 0u32, 0u32, 0u32];
-            saci::send_words(interface, &words, Duration::from_millis(100))?;
-            let response = saci::read_response(interface, Duration::from_secs(10))?;
-            let result = SaciResult::from(((response >> 16) & 0xFF) as u8);
-            match result {
-                SaciResult::Success => Ok(true),
-                SaciResult::Crc32Mismatch | SaciResult::BlankCheckFailed => Ok(false),
-                _ => Err(ArmError::Other(format!(
-                    "SACI FLASH_VERIFY_CCFG_SECTOR failed: {result:?}"
-                ))
-                .into()),
-            }
-        } else {
-            // FLASH_VERIFY_MAIN_SECTORS (0x10): [header, firstSectorAddr, byteCount, expCrc32]
-            let expected_crc = saci::crc32_iso_hdlc(data);
-            let header = saci::make_header(saci::cmd::FLASH_VERIFY_MAIN_SECTORS, 0);
-            let words = [header, address as u32, data.len() as u32, expected_crc];
-            saci::send_words(interface, &words, Duration::from_millis(100))?;
-            let response = saci::read_response(interface, Duration::from_secs(10))?;
-            let result = SaciResult::from(((response >> 16) & 0xFF) as u8);
-            match result {
-                SaciResult::Success => Ok(true),
-                SaciResult::Crc32Mismatch => Ok(false),
-                _ => Err(ArmError::Other(format!(
-                    "SACI FLASH_VERIFY_MAIN_SECTORS failed: {result:?}"
-                ))
-                .into()),
-            }
-        }
     }
 
     fn supports_sector_erase(&self) -> bool {

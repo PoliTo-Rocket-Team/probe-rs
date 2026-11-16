@@ -3,30 +3,10 @@ use std::sync::Mutex;
 use probe_rs::{
     integration::{FakeProbe, ProbeLister},
     probe::{
-        DebugProbe, DebugProbeError, DebugProbeInfo, DebugProbeSelector, Probe, ProbeCreationError,
-        ProbeFactory, list::ProbeListItem,
+        DebugProbeError, DebugProbeInfo, DebugProbeSelector, Probe, ProbeCreationError,
+        ProbeTransport, list::ProbeListItem,
     },
 };
-use std::fmt::Display;
-
-#[derive(Debug)]
-pub struct MockProbeFactory;
-
-impl Display for MockProbeFactory {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("Mocked Probe")
-    }
-}
-
-impl ProbeFactory for MockProbeFactory {
-    fn open(&self, _selector: &DebugProbeSelector) -> Result<Box<dyn DebugProbe>, DebugProbeError> {
-        unreachable!("TestLister opens FakeProbe directly")
-    }
-
-    fn list_probes(&self) -> Vec<ProbeListItem> {
-        Vec::new()
-    }
-}
 
 #[derive(Debug)]
 pub struct TestLister {
@@ -43,12 +23,14 @@ impl TestLister {
 
 impl ProbeLister for TestLister {
     fn open(&self, selector: &DebugProbeSelector) -> Result<Probe, DebugProbeError> {
+        let DebugProbeSelector::Usb(selector) = selector;
         #[expect(
             clippy::unwrap_used,
             reason = "Test lister: a poisoned mutex is unrecoverable"
         )]
         let mut probes = self.probes.lock().unwrap();
         let probe_index = probes.iter().position(|(info, _)| {
+            let ProbeTransport::Usb(info) = &info.transport;
             info.product_id == selector.product_id
                 && info.vendor_id == selector.vendor_id
                 && info.serial_number == selector.serial_number

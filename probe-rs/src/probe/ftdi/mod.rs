@@ -15,7 +15,8 @@ use crate::{
     probe::{
         BitbangSwd, DebugProbe, DebugProbeError, DebugProbeInfo, DebugProbeSelector,
         IoSequenceItem, JtagChain, JtagChainAccess, JtagChainState, JtagOp, JtagProbe,
-        ProbeCreationError, ProbeFactory, ResetLine, SwdProbe, SwdSettings, WireProtocol,
+        ProbeCreationError, ProbeFactory, ProbeTransport, ResetLine, SwdProbe, SwdSettings,
+        UsbProbeInfo, UsbSelector, WireProtocol,
         jtag::{Step, TapState, distribute_captures, walk_batch},
         list::{ProbeListItem, usb_probe_accessibility},
         queue::{BatchExecutionError, Results},
@@ -357,6 +358,7 @@ impl std::fmt::Display for FtdiProbeFactory {
 
 impl ProbeFactory for FtdiProbeFactory {
     fn open(&self, selector: &DebugProbeSelector) -> Result<Box<dyn DebugProbe>, DebugProbeError> {
+        let DebugProbeSelector::Usb(selector) = selector;
         // Only open FTDI-compatible probes
         let Some(ftdi) = FTDI_COMPAT_DEVICES
             .iter()
@@ -408,7 +410,7 @@ impl ProbeFactory for FtdiProbeFactory {
         // listed entries.
         //
         // So match as the default does, but ignoring interface.
-        let selector = selector.map(|selector| DebugProbeSelector {
+        let selector = selector.map(|DebugProbeSelector::Usb(selector)| UsbSelector {
             interface: None,
             ..selector.clone()
         });
@@ -712,14 +714,18 @@ impl TryFrom<(FtdiDevice, Option<ChipType>)> for FtdiProperties {
         };
 
         let properties = match chip_type {
-            ChipType::FT2232H | ChipType::FT4232H | ChipType::FT2232HP | ChipType::FT4232HP => {
-                Self {
-                    buffer_size: 4096,
-                    max_clock: 30_000,
-                    has_divide_by_5: true,
-                }
-            }
-            ChipType::FT232H | ChipType::FT232HP => Self {
+            ChipType::FT2232H
+            | ChipType::FT4232H
+            | ChipType::FT2233HP
+            | ChipType::FT4233HP
+            | ChipType::FT2232HP
+            | ChipType::FT4232HP
+            | ChipType::FT4232HA => Self {
+                buffer_size: 4096,
+                max_clock: 30_000,
+                has_divide_by_5: true,
+            },
+            ChipType::FT232H | ChipType::FT233HP | ChipType::FT232HP => Self {
                 buffer_size: 1024,
                 max_clock: 30_000,
                 has_divide_by_5: true,
@@ -779,6 +785,41 @@ static FTDI_COMPAT_DEVICES: &[FtdiDevice] = &[
         id: (0x0403, 0x6014),
         fallback_chip_type: ChipType::FT232H,
     },
+    // FTDI Ltd. FT2233HP Dual HS USB-UART/MPSSE IC with Type-C/PD
+    FtdiDevice {
+        id: (0x0403, 0x6040),
+        fallback_chip_type: ChipType::FT2233HP,
+    },
+    // FTDI Ltd. FT4233HP Quad HS USB-UART/MPSSE IC with Type-C/PD
+    FtdiDevice {
+        id: (0x0403, 0x6041),
+        fallback_chip_type: ChipType::FT4233HP,
+    },
+    // FTDI Ltd. FT2232HP Dual HS USB-UART/MPSSE IC with Type-C/PD
+    FtdiDevice {
+        id: (0x0403, 0x6042),
+        fallback_chip_type: ChipType::FT2232HP,
+    },
+    // FTDI Ltd. FT4232HP Quad HS USB-UART/MPSSE IC with Type-C/PD
+    FtdiDevice {
+        id: (0x0403, 0x6043),
+        fallback_chip_type: ChipType::FT4232HP,
+    },
+    // FTDI Ltd. FT233HP Single HS USB-UART/MPSSE IC with Type-C/PD
+    FtdiDevice {
+        id: (0x0403, 0x6044),
+        fallback_chip_type: ChipType::FT233HP,
+    },
+    // FTDI Ltd. FT232HP Single HS USB-UART/MPSSE IC with Type-C/PD
+    FtdiDevice {
+        id: (0x0403, 0x6045),
+        fallback_chip_type: ChipType::FT232HP,
+    },
+    // FTDI Ltd. FT4232HA Quad HS USB-UART/MPSSE IC (automotive)
+    FtdiDevice {
+        id: (0x0403, 0x6048),
+        fallback_chip_type: ChipType::FT4232HA,
+    },
     //
     // --- Third-party VID/PID pairs ---
     //
@@ -824,13 +865,15 @@ fn get_device_info(device: &DeviceInfo) -> Option<ProbeListItem> {
         ftdi.matches(device).then(|| ProbeListItem {
             info: DebugProbeInfo {
                 identifier: device.product_string().unwrap_or("FTDI").to_string(),
-                vendor_id: device.vendor_id(),
-                product_id: device.product_id(),
-                serial_number: device.serial_number().map(|s| s.to_string()),
+                transport: ProbeTransport::Usb(UsbProbeInfo {
+                    vendor_id: device.vendor_id(),
+                    product_id: device.product_id(),
+                    serial_number: device.serial_number().map(|s| s.to_string()),
+                    is_hid_interface: false,
+                    interface: None,
+                    usb_location: Some((device.bus_id().to_string(), device.device_address())),
+                }),
                 probe_factory: &FtdiProbeFactory,
-                is_hid_interface: false,
-                interface: None,
-                usb_location: Some((device.bus_id().to_string(), device.device_address())),
             },
             accessibility: usb_probe_accessibility(device),
         })

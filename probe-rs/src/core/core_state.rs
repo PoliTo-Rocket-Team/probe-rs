@@ -53,9 +53,10 @@ impl CombinedCoreState {
             );
         };
 
-        Ok(XtensaDebugInterfaceState::new(
-            (&options.core_properties).try_into()?,
-        ))
+        Ok(
+            XtensaDebugInterfaceState::new((&options.core_properties).try_into()?)
+                .with_skip_bulk_write_status(options.skip_bulk_write_status),
+        )
     }
 
     pub(crate) fn attach_arm<'probe>(
@@ -211,6 +212,9 @@ impl CombinedCoreState {
 
         let hart = options.hart_id.unwrap_or_default();
         interface.select_hart(hart)?;
+        interface
+            .memory_access_config()
+            .set_target_overrides(&options.memory_access);
 
         match &mut self.specific_state {
             SpecificCoreState::Riscv(s) => Ok(Core::new(

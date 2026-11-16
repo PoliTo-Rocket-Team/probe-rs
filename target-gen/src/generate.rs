@@ -220,6 +220,7 @@ fn create_core(processor: &Processor) -> Result<ProbeCore> {
                 hart_id: None,
                 jtag_tap: None,
                 mem_ap: None,
+                memory_access: vec![],
             }),
             Architecture::Xtensa => CoreAccessOptions::Xtensa(XtensaCoreAccessOptions {
                 jtag_tap: None,
@@ -229,6 +230,7 @@ fn create_core(processor: &Processor) -> Result<ProbeCore> {
                     fpu: None,
                     window_properties: Some(XtensaWindowProperties { num_aregs: 64 }),
                 },
+                skip_bulk_write_status: false,
             }),
         },
     })

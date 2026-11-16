@@ -168,16 +168,21 @@ pub type SwdBatch = Batch<SwdOp, DebugProbeError>;
 impl SwdBatch {
     /// Schedule a read and return a handle for the captured value.
     pub fn read(&mut self, port: Port, addr: u8) -> Handle<u32> {
-        self.schedule(SwdOp::Transfer {
-            port,
-            addr,
-            direction: Direction::Read,
-            data: 0,
-        })
-        .map(|result| match result {
+        // Not `map`: its closure would capture, and allocate, the conversion it wraps.
+        let handle = Handle::new(Box::new(|result| match result {
             CommandResult::U32(value) => value,
             _ => panic!("unexpected CommandResult variant for an SWD read"),
-        })
+        }));
+        self.schedule_preserved(
+            handle.id().clone(),
+            SwdOp::Transfer {
+                port,
+                addr,
+                direction: Direction::Read,
+                data: 0,
+            },
+        );
+        handle
     }
 
     /// Schedule a write.
@@ -824,11 +829,11 @@ mod tests {
         probe.fault_transfer = Some(1);
 
         let mut batch = SwdBatch::new();
-        let _ = batch.read(Port::Dp, 0b0100);
+        let before = batch.read(Port::Dp, 0b0100);
         batch.idle(4);
         let first = batch.read(Port::Dp, 0b0100);
         let _ = batch.read(Port::Dp, 0b0100);
-        let error = SwdProbe::run_batch(&mut probe, &batch).unwrap_err();
+        let mut error = SwdProbe::run_batch(&mut probe, &batch).unwrap_err();
 
         assert_eq!(error.fault_operation, 2);
         assert!(matches!(
@@ -839,6 +844,7 @@ mod tests {
         ));
         // The transfers before the fault keep their results.
         assert_eq!(error.results.len(), 1);
+        assert!(error.results.take(before).is_ok());
         drop(first);
     }
 

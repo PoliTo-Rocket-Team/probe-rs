@@ -11,7 +11,7 @@ use anyhow::Result;
 use std::sync::Arc;
 use tokio::task::JoinHandle;
 
-use crate::rpc::functions::{ProbeAccess, RpcApp};
+use crate::rpc::functions::{HostFiles, ProbeAccess, RpcApp};
 use crate::rpc::probe_broker::ProbeBroker;
 use crate::util::probe_config::ProbeConfigs;
 #[cfg(feature = "remote")]
@@ -43,7 +43,8 @@ impl DapRpcConnection {
         }
 
         let probe_broker = Arc::new(ProbeBroker::new_with_config(probe_configs.clone()));
-        let (local_server, tx, rx) = RpcApp::create_server(16, ProbeAccess::All, probe_broker);
+        let (local_server, tx, rx) =
+            RpcApp::create_server(16, ProbeAccess::All, probe_broker, HostFiles::Allow);
         let handle = tokio::spawn(local_server.run());
         let client = RpcClient::new_local_from_wire(tx, rx);
         Ok(Self {
@@ -91,10 +92,10 @@ pub(crate) async fn with_dap_rpc_connection<R>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cmd::dap_server::test::{MockProbeFactory, TestLister};
+    use crate::cmd::dap_server::test::TestLister;
     use crate::util::common_options::ProbeOptions;
     use probe_rs::architecture::arm::FullyQualifiedApAddress;
-    use probe_rs::integration::{FakeProbe, Operation};
+    use probe_rs::integration::{FakeProbe, FakeProbeFactory, Operation};
     use probe_rs::probe::DebugProbeInfo;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -112,7 +113,7 @@ mod tests {
             0x12,
             0x23,
             Some(serial.to_owned()),
-            &MockProbeFactory,
+            &FakeProbeFactory,
             None,
             false,
         );
@@ -130,10 +131,11 @@ mod tests {
         use crate::util::cli::attach_probe;
 
         let probes = client.list_probes().await?;
-        anyhow::ensure!(
-            probes.iter().any(|p| p.serial_number == serial),
-            "probe {serial} not listed"
-        );
+        let is_probe = |p: &probe_rs_rpc::probe::DebugProbeEntry| {
+            let probe_rs_rpc::probe::ProbeTransport::Usb(usb) = &p.transport;
+            usb.serial_number == serial
+        };
+        anyhow::ensure!(probes.iter().any(is_probe), "probe {serial} not listed");
 
         let options = ProbeOptions {
             chip: Some(TEST_CHIP_NAME.to_owned()),
@@ -143,7 +145,7 @@ mod tests {
             non_interactive: true,
             probe: probes
                 .into_iter()
-                .find(|p| p.serial_number == serial)
+                .find(|p| is_probe(p))
                 .map(|p| from_wire_debug_probe_selector(p.selector())),
             speed: None,
             connect_under_reset: false,
@@ -165,6 +167,7 @@ mod tests {
             16,
             lister as Arc<dyn probe_rs::integration::ProbeLister + Send + Sync>,
             probe_broker,
+            HostFiles::Allow,
         );
         let handle = tokio::spawn(async move {
             server.run().await;

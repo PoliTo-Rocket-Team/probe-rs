@@ -408,7 +408,13 @@ fn component_tree_to_termtree(node: &ComponentTreeNode) -> Tree<String> {
 
 fn format_debug_port_info_node(node: &DebugPortInfoNode) -> String {
     fn format_jep(jep: JEP106Code) -> String {
-        format!("Designer: {}", jep.get().unwrap_or("<unknown>"))
+        match jep.get() {
+            Some(name) => format!("Designer: {name}"),
+            None => format!(
+                "Designer: <unknown> (cc: {:#04x}, id: {:#04x})",
+                jep.cc, jep.id
+            ),
+        }
     }
 
     let mut output = String::new();
@@ -430,7 +436,10 @@ fn format_debug_port_info_node(node: &DebugPortInfoNode) -> String {
         write!(output, ", MINDP").unwrap();
     }
 
-    if node.dp_info.version == DebugPortVersion::DPv2 {
+    if matches!(
+        node.dp_info.version,
+        DebugPortVersion::DPv2 | DebugPortVersion::DPv3
+    ) {
         let target_id = TARGETID(node.targetid);
         let dlpidr = DLPIDR(node.dlpidr);
 
@@ -547,6 +556,33 @@ mod tests {
         assert_eq!(
             super::format_riscv_isa(&isa),
             "RVIM (XLEN unknown), Privilege modes: M"
+        );
+    }
+
+    #[test]
+    fn dp_info_shows_targetid_on_dpv2_and_dpv3() {
+        use probe_rs_rpc::{
+            chip::JEP106Code,
+            info::{DebugPortId, DebugPortInfoNode, DebugPortVersion, MinDpSupport},
+        };
+
+        let node = |version| DebugPortInfoNode {
+            dp_info: DebugPortId {
+                revision: 0,
+                part_no: 0,
+                version,
+                min_dp_support: MinDpSupport::NotImplemented,
+                designer: JEP106Code { id: 0x3b, cc: 4 },
+            },
+            targetid: 0x0100_2927,
+            dlpidr: 0,
+        };
+
+        for version in [DebugPortVersion::DPv2, DebugPortVersion::DPv3] {
+            assert!(super::format_debug_port_info_node(&node(version)).contains("Part: "));
+        }
+        assert!(
+            !super::format_debug_port_info_node(&node(DebugPortVersion::DPv1)).contains("Part: ")
         );
     }
 

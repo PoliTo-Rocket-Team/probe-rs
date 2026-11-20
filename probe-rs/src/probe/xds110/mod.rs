@@ -148,7 +148,12 @@ fn probe_name(device: &nusb::DeviceInfo) -> String {
 
 impl ProbeFactory for Xds110Factory {
     fn open(&self, selector: &DebugProbeSelector) -> Result<Box<dyn DebugProbe>, DebugProbeError> {
-        let DebugProbeSelector::Usb(selector) = selector;
+        // Probes of this driver are selected by VID:PID; other selectors are for other drivers.
+        let DebugProbeSelector::Usb(selector) = selector else {
+            return Err(DebugProbeError::ProbeCouldNotBeCreated(
+                ProbeCreationError::NotFound,
+            ));
+        };
         let devices = nusb::list_devices()
             .wait()
             .map_err(|e| ProbeCreationError::Usb(e.into()))?;
@@ -523,7 +528,7 @@ impl DebugProbe for Xds110 {
                 self.jtag_state.tap_state = crate::probe::TapState::TestLogicReset;
                 self.goto_state(jtag::XdsState::Reset)
             }
-            WireProtocol::CJtag => self.cjtag_attach(),
+            WireProtocol::CJtag(_) => self.cjtag_attach(),
         }
     }
 
@@ -574,13 +579,10 @@ impl DebugProbe for Xds110 {
         sequence: Arc<dyn ArmDebugSequence>,
     ) -> Result<Box<dyn ArmDebugInterface + 'probe>, (Box<dyn DebugProbe>, ArmError)> {
         let settings = SwdProbe::swd_settings(self.as_ref());
-        Ok(match self.protocol {
-            WireProtocol::Jtag | WireProtocol::CJtag => {
-                ArmCommunicationInterface::create_jtag(self, settings, sequence, false)
-            }
-            WireProtocol::Swd => {
-                ArmCommunicationInterface::create_swd(self, settings, sequence, false)
-            }
+        Ok(if self.protocol.is_jtag() {
+            ArmCommunicationInterface::create_jtag(self, settings, sequence, false)
+        } else {
+            ArmCommunicationInterface::create_swd(self, settings, sequence, false)
         })
     }
 

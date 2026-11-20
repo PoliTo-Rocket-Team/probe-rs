@@ -57,7 +57,7 @@ pub use queue::{
 };
 #[allow(deprecated)]
 pub use queue::{DeferredResultIndex, DeferredResultSet, ErasedQueue, Queue};
-pub use selector::{DebugProbeSelector, UsbSelector};
+pub use selector::{DebugProbeSelector, TcpAddress, UsbSelector};
 pub use swd::{
     BitbangSwd, Direction, IoSequenceItem, Pins, Port, SwdBatch, SwdOp, SwdPort, SwdProbe,
     SwdSettings, SwdTransferError,
@@ -91,6 +91,15 @@ pub(crate) fn register_probe_factory(factory: &'static dyn ProbeFactory) {
     DRIVERS.write().push(factory);
 }
 
+/// Which  selection sequence to use when cJTAG is selected.
+#[derive(Copy, Clone, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+pub enum CjtagActivation {
+    /// Long-form sequence
+    Long,
+    /// Short-form sequence
+    Short,
+}
+
 /// The protocol that is to be used by the probe when communicating with the target.
 ///
 /// For ARM select `Swd` or `Jtag`, for RISC-V select `Jtag`. `CJtag` is JTAG over the two
@@ -105,13 +114,18 @@ pub enum WireProtocol {
     Jtag,
     /// Compact JTAG (IEEE 1149.7) on two wires, TMSC and TCKC, in the OScan1 format. The probe
     /// translates the JTAG operations, so the target sees JTAG.
-    CJtag,
+    CJtag(CjtagActivation),
 }
 
 impl WireProtocol {
     /// Whether the protocol carries JTAG operations: JTAG or cJTAG.
     pub fn is_jtag(self) -> bool {
-        matches!(self, WireProtocol::Jtag | WireProtocol::CJtag)
+        matches!(self, WireProtocol::Jtag | WireProtocol::CJtag(_))
+    }
+
+    /// Whether the protocol is cJTAG specifically.
+    pub fn is_cjtag(self) -> bool {
+        matches!(self, WireProtocol::CJtag(_))
     }
 }
 
@@ -120,7 +134,13 @@ impl fmt::Display for WireProtocol {
         match self {
             WireProtocol::Swd => f.write_str("SWD"),
             WireProtocol::Jtag => f.write_str("JTAG"),
-            WireProtocol::CJtag => f.write_str("cJTAG"),
+            WireProtocol::CJtag(selection_sequence) => {
+                if selection_sequence == &CjtagActivation::Long {
+                    f.write_str("cJTAG")
+                } else {
+                    f.write_str("cJTAG (Short OAC)")
+                }
+            }
         }
     }
 }
@@ -132,9 +152,10 @@ impl std::str::FromStr for WireProtocol {
         match &s.to_ascii_lowercase()[..] {
             "swd" => Ok(WireProtocol::Swd),
             "jtag" => Ok(WireProtocol::Jtag),
-            "cjtag" => Ok(WireProtocol::CJtag),
+            "cjtag" => Ok(WireProtocol::CJtag(CjtagActivation::Long)),
+            "cjtag-short" => Ok(WireProtocol::CJtag(CjtagActivation::Short)),
             _ => Err(format!(
-                "'{s}' is not a valid protocol. Choose 'swd', 'jtag' or 'cjtag'."
+                "'{s}' is not a valid protocol. Choose 'swd', 'jtag', 'cjtag', or 'cjtag-short'."
             )),
         }
     }
@@ -998,10 +1019,12 @@ pub struct DebugProbeInfo {
 pub enum ProbeTransport {
     /// A USB probe.
     ///
-    /// Probes that are not on USB, such as those reached over TCP and the Linux GPIO and SPI
-    /// probes, are listed with this variant too for now: with a placeholder VID and PID, and their
-    /// address as the serial number.
+    /// Some probes that are not on USB, such as the Linux GPIO and SPI probes and some probes
+    /// reached over TCP, are listed with this variant too for now: with a placeholder VID and PID,
+    /// and their address as the serial number.
     Usb(UsbProbeInfo),
+    /// A probe reached over TCP.
+    Tcp(TcpAddress),
 }
 
 /// A USB debug probe.
@@ -1026,24 +1049,27 @@ pub struct UsbProbeInfo {
     pub usb_location: Option<(String, u8)>,
 }
 
+impl std::fmt::Display for ProbeTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            ProbeTransport::Usb(usb) => {
+                write!(f, "{:04x}:{:04x}", usb.vendor_id, usb.product_id)?;
+                if let Some(interface) = usb.interface {
+                    write!(f, "-{interface}")?;
+                }
+                write!(f, ":{}", usb.serial_number.as_deref().unwrap_or(""))
+            }
+            ProbeTransport::Tcp(address) => address.fmt(f),
+        }
+    }
+}
+
 impl std::fmt::Display for DebugProbeInfo {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        let ProbeTransport::Usb(usb) = &self.transport;
         write!(
             f,
-            "{} -- {:04x}:{:04x}",
-            self.identifier, usb.vendor_id, usb.product_id,
-        )?;
-
-        if let Some(interface) = usb.interface {
-            write!(f, "-{}", interface)?;
-        }
-
-        write!(
-            f,
-            ":{} ({})",
-            usb.serial_number.as_deref().unwrap_or(""),
-            self.probe_factory
+            "{} -- {} ({})",
+            self.identifier, self.transport, self.probe_factory
         )
     }
 }

@@ -8,10 +8,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use probe_rs_target::CoreType;
+use probe_rs_target::{CoreType, MemoryRegion};
 
 pub use crate::flashing::DebugFlashSequence;
-use crate::flashing::FlashCompare;
+use crate::flashing::{FlashCompare, FlashError};
 
 use crate::{
     MemoryInterface, MemoryMappedRegister,
@@ -573,7 +573,7 @@ pub trait ArmDebugSequence: Send + Sync + Debug {
             // Make sure the debug port is in the correct mode based on what the probe
             // has selected via active_protocol
             match interface.active_protocol() {
-                Some(WireProtocol::Jtag | WireProtocol::CJtag) => {
+                Some(WireProtocol::Jtag | WireProtocol::CJtag(_)) => {
                     if has_dormant {
                         tracing::debug!("Select Dormant State (from SWD)");
                         interface.swj_sequence(&BitSequence::from_u64(16, 0xE3BC))?;
@@ -1028,7 +1028,7 @@ pub trait ArmDebugSequence: Send + Sync + Debug {
         dp: DpAddress,
     ) -> Result<(), ArmError> {
         match interface.active_protocol() {
-            Some(WireProtocol::Jtag | WireProtocol::CJtag) => {
+            Some(WireProtocol::Jtag | WireProtocol::CJtag(_)) => {
                 tracing::debug!("JTAG: No special sequence needed to connect to debug port");
                 return Ok(());
             }
@@ -1226,6 +1226,17 @@ pub trait ArmDebugSequence: Send + Sync + Debug {
     /// This sequence is called before an image that boots from RAM is written, after the cores
     /// that boot from it were reset and halted.
     fn prepare_loading_to_ram(&self, _session: &mut crate::Session) -> Result<(), crate::Error> {
+        Ok(())
+    }
+
+    /// Called once per session, before the first flash loader is built. Changes to
+    /// `memory_map`, which starts as a copy of the session target's memory map, replace that
+    /// memory map.
+    fn detect_memory_map(
+        &self,
+        _session: &mut crate::Session,
+        _memory_map: &mut Vec<MemoryRegion>,
+    ) -> Result<(), FlashError> {
         Ok(())
     }
 

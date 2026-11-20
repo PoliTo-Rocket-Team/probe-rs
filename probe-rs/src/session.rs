@@ -1,3 +1,5 @@
+use probe_rs_target::ScanMode;
+
 use crate::{
     Core, CoreType, Error,
     architecture::{
@@ -23,10 +25,11 @@ use crate::{
         DebugSequence, MemoryApExt, RegistryError, Target, TargetSelector, registry::Registry,
     },
     core::{Architecture, CombinedCoreState},
+    flashing::FlashError,
     memory_port::MemoryAccessPort,
     probe::{
-        AttachMethod, BitSequence, DebugProbe, DebugProbeError, Probe, ProbeCreationError,
-        WireProtocol, list::Lister,
+        AttachMethod, BitSequence, CjtagActivation, DebugProbe, DebugProbeError, Probe,
+        ProbeCreationError, WireProtocol, list::Lister,
     },
 };
 use std::collections::BTreeSet;
@@ -57,6 +60,7 @@ pub struct Session {
     interfaces: ArchitectureInterface,
     cores: Vec<CombinedCoreState>,
     configured_trace_sink: Option<TraceSink>,
+    memory_map_detected: bool,
 }
 
 /// The `SessionConfig` struct is used to configure a new `Session` during auto-attach.
@@ -348,6 +352,7 @@ impl Session {
                 interfaces,
                 cores,
                 configured_trace_sink: None,
+                memory_map_detected: false,
             };
 
             {
@@ -390,6 +395,7 @@ impl Session {
                 interfaces,
                 cores,
                 configured_trace_sink: None,
+                memory_map_detected: false,
             })
         }
     }
@@ -444,17 +450,28 @@ impl Session {
         // While we still don't support mixed architectures
         // (they'd need per-core debug sequences), we can at least
         // handle most of the setup in the same way.
-        if let Some(jtag) = target.jtag.as_ref()
-            && let Some(scan_chain) = jtag.scan_chain.clone()
-            && let Some(mut chain) = probe.try_as_jtag_chain()
-        {
-            if jtag.force_scan_chain {
-                // Bypass JTAG auto-detection entirely; use the scan chain from the target YAML.
-                // This is required for targets whose TAP does not respond to the standard IDCODE
-                // DR scan (e.g., some RISC-V cores during early power-up).
-                chain.set_chain(&scan_chain);
-            } else {
-                chain.set_expected(&scan_chain);
+        if let Some(jtag) = target.jtag.as_ref() {
+            if let Some(scan_chain) = jtag.scan_chain.clone()
+                && let Some(mut chain) = probe.try_as_jtag_chain()
+            {
+                if jtag.force_scan_chain {
+                    // Bypass JTAG auto-detection entirely; use the scan chain from the target YAML.
+                    // This is required for targets whose TAP does not respond to the standard IDCODE
+                    // DR scan (e.g., some RISC-V cores during early power-up).
+                    chain.set_chain(&scan_chain);
+                } else {
+                    chain.set_expected(&scan_chain);
+                }
+            }
+
+            match jtag.scan_mode {
+                ScanMode::Oscan1 => {
+                    probe.select_protocol(WireProtocol::CJtag(CjtagActivation::Long))?;
+                }
+                ScanMode::Oscan1Short => {
+                    probe.select_protocol(WireProtocol::CJtag(CjtagActivation::Short))?;
+                }
+                _ => {}
             }
         }
 
@@ -533,6 +550,7 @@ impl Session {
             interfaces,
             cores,
             configured_trace_sink: None,
+            memory_map_detected: false,
         };
 
         // Connect to the cores
@@ -894,6 +912,34 @@ impl Session {
                 xtensa_debug_sequence.prepare_loading_to_ram(self)
             }
         }
+    }
+
+    /// Updates the target's memory map with the regions that the debug sequence detects on
+    /// the device. Only the first call in a session runs the detection.
+    ///
+    /// Call this before you create a flash loader with [`Target::flash_loader`].
+    pub fn detect_memory_map(&mut self) -> Result<(), FlashError> {
+        if self.memory_map_detected {
+            return Ok(());
+        }
+
+        let mut memory_map = self.target.memory_map.clone();
+        match self.target.debug_sequence.clone() {
+            DebugSequence::Arm(sequence) => sequence.detect_memory_map(self, &mut memory_map)?,
+            DebugSequence::Riscv(sequence) => sequence.detect_memory_map(self, &mut memory_map)?,
+            DebugSequence::Xtensa(sequence) => sequence.detect_memory_map(self, &mut memory_map)?,
+        }
+
+        for region in memory_map
+            .iter()
+            .filter(|region| !self.target.memory_map.contains(region))
+        {
+            tracing::info!("Detected memory region: {region:#x?}");
+        }
+        self.target.memory_map = memory_map;
+        self.memory_map_detected = true;
+
+        Ok(())
     }
 
     /// Check if the connected device has a debug erase sequence defined

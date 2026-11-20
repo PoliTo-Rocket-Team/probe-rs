@@ -36,7 +36,7 @@ pub struct TargetMetadataRequest {
     pub sessid: Key<Session>,
 }
 
-#[derive(Serialize, Deserialize, Schema)]
+#[derive(Clone, Serialize, Deserialize, Schema)]
 pub struct TargetInfoRequest {
     pub probe: DebugProbeEntry,
     pub speed: Option<u32>,
@@ -69,6 +69,8 @@ pub enum InfoEvent {
     ArmError {
         dp_addr: DpAddress,
         error: String,
+        /// The debug port answered before the error, so the chip is an ARM chip.
+        dp_found: bool,
     },
     Idcode {
         architecture: String,
@@ -82,6 +84,12 @@ pub enum InfoEvent {
         index: u32,
     },
     RiscvDebugModule(RiscvDebugModuleInfo),
+    /// The chip that a WCH-Link probe reported when it attached.
+    WchChip {
+        family: u8,
+        family_name: String,
+        chip_id: u32,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Schema)]

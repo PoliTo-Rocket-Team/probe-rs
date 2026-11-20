@@ -110,11 +110,10 @@ impl DebugProbe for LinuxGpiod {
     }
 
     fn select_protocol(&mut self, protocol: WireProtocol) -> Result<(), DebugProbeError> {
-        match protocol {
-            WireProtocol::Swd => Ok(()),
-            WireProtocol::Jtag | WireProtocol::CJtag => {
-                Err(DebugProbeError::UnsupportedProtocol(protocol))
-            }
+        if protocol.is_jtag() {
+            Err(DebugProbeError::UnsupportedProtocol(protocol))
+        } else {
+            Ok(())
         }
     }
 
@@ -194,7 +193,12 @@ impl fmt::Display for LinuxGpiodFactory {
 
 impl ProbeFactory for LinuxGpiodFactory {
     fn open(&self, selector: &DebugProbeSelector) -> Result<Box<dyn DebugProbe>, DebugProbeError> {
-        let DebugProbeSelector::Usb(selector) = selector;
+        // This probe is selected with the placeholder VID:PID 0:0.
+        let DebugProbeSelector::Usb(selector) = selector else {
+            return Err(DebugProbeError::ProbeCouldNotBeCreated(
+                ProbeCreationError::NotFound,
+            ));
+        };
         // We're never a USB device; let other factories handle non-zero VID/PID.
         if selector.vendor_id != 0 || selector.product_id != 0 {
             return Err(DebugProbeError::ProbeCouldNotBeCreated(
@@ -295,7 +299,9 @@ mod tests {
         let s = sel(&format!("0:0:{serial}"));
         let entries = LinuxGpiodFactory.list_probes_filtered(Some(&s));
         assert_eq!(entries.len(), 1);
-        let ProbeTransport::Usb(info) = &entries[0].info.transport;
+        let ProbeTransport::Usb(info) = &entries[0].info.transport else {
+            panic!("not a USB probe");
+        };
         assert_eq!(info.vendor_id, 0);
         assert_eq!(info.product_id, 0);
         assert_eq!(info.serial_number.as_deref(), Some(serial));

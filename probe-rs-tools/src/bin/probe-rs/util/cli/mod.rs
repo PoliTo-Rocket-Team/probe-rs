@@ -145,8 +145,9 @@ pub async fn attach_request(
         )
         .await?;
         // The probe gets a new USB device address when it enumerates again.
-        let probe_rs_rpc::probe::ProbeTransport::Usb(usb) = &mut probe.transport;
-        usb.usb_location = None;
+        if let probe_rs_rpc::probe::ProbeTransport::Usb(usb) = &mut probe.transport {
+            usb.usb_location = None;
+        }
     }
 
     Ok(AttachRequest {
@@ -342,6 +343,8 @@ pub(crate) fn parse_semihosting_options(arg: &[String]) -> anyhow::Result<Semiho
             _ => unreachable!("splitn produces at most 2 items."),
         }
     }
+    // Report a bad mapping at the start, and not when the target uses it.
+    crate::rpc::utils::semihosting_mappings::Mappings::new(&options)?.check_roots()?;
     Ok(options)
 }
 
